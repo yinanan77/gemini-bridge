@@ -1,0 +1,11 @@
+--- a/bridge/minis_gemini_bridge.py
++++ b/bridge/minis_gemini_bridge.py
+@@ -1003,7 +1003,7 @@
+     r"executable\s+not\s+found|no\s+such\s+file\s+or\s+directory)\b"
+ )
+ MCP_RESOURCE_404_RE = re.compile(
+-    r"(?i)(?:\b404\b|\bnot\s+found\b|\bno\s+commit\s+found\b|\bbranch\s+not\s+found\b|\bpath\s+not\s+found\b)"
++    r"(?i)(?:\b404\b|\bnot\s+found\b|\bno\s+commit\s+found\b|\bbranch\s+not\s+found\b|\bpath\s+not\s+found\b|\bthe file does not exist in the repository\b)"
+ )
+ MCP_STATUS_TEXT_ONLY_RE = re.compile(
+     r"(?i)^\s*successfully\s+(?:downloaded|retrieved|fetched)\s+(?:text|binary)?\s*file(?:\s*\([^)]*\))?\s*$"
