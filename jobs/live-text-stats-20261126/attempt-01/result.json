@@ -1,0 +1,21 @@
+{
+  "task_id": "live-text-stats-20261126",
+  "attempt": 1,
+  "contract_sha256": "da5057746cada99a5474802e763ccdaffdab87bd9a36c3cc9e70cd906a4f4908",
+  "status": "completed",
+  "summary": "Implemented stdlib-only Chinese-script text statistics tool (count_text API and UTF-8 file/stdin JSON CLI) in examples/text_stats.py, comprehensive unit tests covering empty input, Chinese+English, whitespace/newlines, CRLF, emoji/non-basic Han, invalid input types, and CLI valid/error paths in examples/test_text_stats.py, and concise Chinese usage documentation in examples/TEXT_STATS.md. Verified py_compile and 12/12 unittest passes.",
+  "artifacts": [
+    "examples/TEXT_STATS.md",
+    "examples/test_text_stats.py",
+    "examples/text_stats.py"
+  ],
+  "tests": {
+    "commands": [
+      "python3 -m py_compile examples/text_stats.py",
+      "python3 -m py_compile examples/test_text_stats.py",
+      "python3 -m unittest discover -s examples -p test_text_stats.py"
+    ],
+    "passed": 12,
+    "failed": 0
+  }
+}
