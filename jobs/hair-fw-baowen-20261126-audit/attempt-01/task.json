@@ -1,0 +1,23 @@
+{
+  "acceptance": [
+    "只创建或更新 text-v4-20261126/AUDIT-20261126.md 与 jobs/hair-fw-baowen-20261126-audit/attempt-01/result.json。",
+    "审核报告逐条覆盖上述5项检查，并给具体文件与位置依据。",
+    "报告中明确是否仍存在偏题剧情、造型越界、母版改动、模块缺失或绝对数量禁令。",
+    "结论区分通过与必须修，并列出未验证项。",
+    "result.json 记录执行命令与自查结果。"
+  ],
+  "allowed_write_paths": [
+    "text-v4-20261126/AUDIT-20261126.md"
+  ],
+  "attempt": 1,
+  "base_branch": "main",
+  "contract_sha256": "0abbacc33c093b0d91a6470c798e14c587d74d8819bb7c0c10958ac9e3d82d49",
+  "goal": "独立审核任务。你不修改任何正文，只写一份审核报告。\n\n审对象：仓库分支 gpt-gemini/jobs/hair-fw-baowen-20261126 下 text-v4-20261126/ 的 FRAMEWORK.md、MOTHER.md、TRIAL.md、CHANGES.md（由另一个会话产出，不要假定它正确）。\n基线：同分支 inputs/hair-fw-20261126/ 的 FRAMEWORK-baseline.md、MOTHER-baseline.md、TRIAL-baseline.md、BAOWEN-ORIGINAL.md、DIAGNOSIS.md。\n\n请逐项核：\n1. TRIAL 是否真正回到豹纹原有的审美主线（外形气场不搭→存在感→重心上移/浅金/碎发/露额→锋芒与相处温度→难管却愿意陪逛），是否仍残留“你挑我拎/绕店拿衣/指左边”这类换主题的剧情；开头是否短而能直接听懂，不再靠比喻二次翻译；结尾是否压缩但没有换掉人物落点。\n2. TRIAL 的造型事实是否全在原作清单内（黑发、细框眼镜、两侧下落、刘海与镜框同位、重心上移、浅金、弯曲碎发、中间露额、边缘散发的发尾、白背心、豹纹、金属），有无新增发量/动态/发质/脸型/操作/配饰；虚构场景是否标明；“颜色换成浅金”是否恰一次。\n3. MOTHER 的18个单元原句、槽位、承上启下、定位、顺序是否与基线逐字一致；新增说明是否越权改动原句。\n4. FRAMEWORK 是否保留了基线的全部实质模块（三条开场路径、黑桃默认四步及适用范围、思远方向后置、灰裤多轮分支、句式与原文/自拟区分、结尾不同收法、调用方式、三种结论、引用位置），有无被缩成提纲或新增绝对数量禁令（只许两句/只能一处方向等）。\n5. 是否存在“结构对齐即质量通过”“文本合规即有效”的过度声明；候选/未认可状态是否标注。\n\n输出 text-v4-20261126/AUDIT-20261126.md：结论（通过/需修）、按上列5项逐条判定与证据位置、必须修项（含最小修法）、未验证项。不要改正文，不要声称能证明流量或获客。\n\n完成后在 jobs/hair-fw-baowen-20261126-audit/attempt-01/result.json 写结果清单。",
+  "job_branch": "gpt-gemini/jobs/hair-fw-baowen-20261126-audit",
+  "notes": "只读审核，不改作者正文；材料为用户本人私有文稿。",
+  "repository": "yinanan77/gemini-bridge",
+  "result_snapshot_path": "jobs/hair-fw-baowen-20261126-audit/attempt-01/result.json",
+  "schema_version": 1,
+  "task_id": "hair-fw-baowen-20261126-audit",
+  "task_snapshot_path": "jobs/hair-fw-baowen-20261126-audit/attempt-01/task.json"
+}
