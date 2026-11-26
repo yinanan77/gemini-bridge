@@ -1,0 +1,45 @@
+{
+  "browser-tabs-real.json": {
+    "action": "list_tabs",
+    "data": {
+      "success": true,
+      "text": "Open tabs:\n  Tab 4: Google Antigravity — https://antigravity.google.com/remote?project=561adc82-06e6-4c8c-862f-3ac493b947c1 *"
+    },
+    "ok": true,
+    "timestamp": "2026-11-26T18:26:40+08:00",
+    "tool": "minis-browser-use"
+  },
+  "browser-iife-real.json": {
+    "action": "execute_js",
+    "data": {
+      "page_url": "https://antigravity.google.com/remote/0fcc41eb-6ecc-4880-90bb-ea94674d8bbb?project=561adc82-06e6-4c8c-862f-3ac493b947c1",
+      "success": true,
+      "text": "null\n  tab_id: 4"
+    },
+    "ok": true,
+    "timestamp": "2026-11-26T18:26:40+08:00",
+    "tool": "minis-browser-use"
+  },
+  "browser-object-real.json": {
+    "action": "execute_js",
+    "data": {
+      "page_url": "https://antigravity.google.com/remote/0fcc41eb-6ecc-4880-90bb-ea94674d8bbb?project=561adc82-06e6-4c8c-862f-3ac493b947c1",
+      "success": true,
+      "text": "{\"probe\":true}\n  tab_id: 4"
+    },
+    "ok": true,
+    "timestamp": "2026-11-26T18:28:25+08:00",
+    "tool": "minis-browser-use"
+  },
+  "browser-string-real.json": {
+    "action": "execute_js",
+    "data": {
+      "page_url": "https://antigravity.google.com/remote/0fcc41eb-6ecc-4880-90bb-ea94674d8bbb?project=561adc82-06e6-4c8c-862f-3ac493b947c1",
+      "success": true,
+      "text": "{\"probe\":true}\n  tab_id: 4"
+    },
+    "ok": true,
+    "timestamp": "2026-11-26T18:28:25+08:00",
+    "tool": "minis-browser-use"
+  }
+}
