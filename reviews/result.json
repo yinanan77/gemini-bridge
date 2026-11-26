@@ -1,0 +1,273 @@
+{
+  "audit_id": "AUDIT-BRIDGE-V1",
+  "role": "independent_read_only_auditor",
+  "repository": "yinanan77/gemini-bridge",
+  "branch": "review/gpt-gemini-v1",
+  "audited_commits": {
+    "source_commit": "4d2e3bfc6a0656b1e8c463b1a4ce2ada20e9f5ce",
+    "acceptance_evidence_commit": "7e4630eb62ba4c24718d02957703906817f79fca"
+  },
+  "conclusion": "needs-fix",
+  "summary": "Confirmed all P0/P1 protocol and DOM defects in revision-01.md against protocol-fixtures.json and source code (noting Google's real 'Verify your account to continue.' reply is misclassified as 'returned'), and independently identified and reproduced 10 additional defect classes including 3 new P0 (post-click submit_uncertain wipeout causing double-submit, stale assistant/wrong-tab status contamination and journal URL corruption, detached bodyClone.innerText script/hidden-DOM leakage) and 4 new P1 (symlink escape and arbitrary file overwrite in collector/journal, collector scope blindness and unsanitized tests secret leakage, additional uncertain-send/restart double-submit gaps, and GitHub MCP error misclassification and directory/symlink/JSON-mangling file parser bugs).",
+  "artifacts": [
+    "reviews/bridge-v1-audit.md",
+    "reviews/result.json"
+  ],
+  "inspected_files": [
+    "bridge/minis_gemini_bridge.py",
+    "bridge/test_bridge.py",
+    "bridge/WORKFLOW.md",
+    "bridge/task.example.json",
+    "orchestration/bootstrap/task.json",
+    "orchestration/bootstrap/revision-01.md",
+    "orchestration/bootstrap/protocol-fixtures.json",
+    "orchestration/bootstrap/result.json"
+  ],
+  "tests": {
+    "compile_command": "python3 -m py_compile bridge/minis_gemini_bridge.py bridge/test_bridge.py",
+    "compile_exit_code": 0,
+    "unit_test_command": "python3 -m unittest discover -s bridge -p test_bridge.py -v",
+    "unit_test_exit_code": 0,
+    "passed": 27,
+    "failed": 0,
+    "errors": 0,
+    "live_minis_clis_executed": false,
+    "note": "Existing unit tests mock minis-browser-use and minis-mcp-cli; no live Minis binaries exist in the cloud audit environment and no live tests were faked. Independent non-network reproduction probes were executed directly against bridge/minis_gemini_bridge.py and orchestration/bootstrap/protocol-fixtures.json."
+  },
+  "confirmed_revision_01_findings": [
+    {
+      "id": "R1",
+      "severity": "P0",
+      "file": "bridge/minis_gemini_bridge.py",
+      "symbols": [
+        "BrowserUseClient.list_tabs",
+        "BrowserUseClient.open_url",
+        "BrowserUseClient.navigate",
+        "BrowserUseClient.eval_js",
+        "JS_FOCUS_SELECT_ALL",
+        "build_paste_js",
+        "build_inspect_draft_js",
+        "JS_CLICK_SEND",
+        "build_status_inspect_js"
+      ],
+      "lines": "1038-1181, 1216-1238",
+      "summary": "BrowserUseClient calls nonexistent subcommands/flags (tabs, open, navigate without --url, eval without --script), and all 5 execute_js scripts omit top-level return inside the async wrapper.",
+      "evidence": "Probe 1 captured argvs ['minis-browser-use','tabs'], ['minis-browser-use','open',url], ['minis-browser-use','navigate','--tab-id','4',url], ['minis-browser-use','eval','--tab-id','4','return 1;'] and confirmed all 5 JS scripts omit leading 'return '."
+    },
+    {
+      "id": "R2",
+      "severity": "P0",
+      "file": "bridge/minis_gemini_bridge.py",
+      "symbols": [
+        "parse_browser_envelope"
+      ],
+      "lines": "902-957",
+      "summary": "Fails to parse JSON in data.text with trailing '\\n  tab_id: N', ignores data.page_url, and fails to treat data.success=false as an error.",
+      "evidence": "Probe 1 against browser-object-real.json dropped '{\"probe\":true}' into human_text; probe with data.success=false did not raise BrowserError."
+    },
+    {
+      "id": "R3",
+      "severity": "P0",
+      "file": "bridge/minis_gemini_bridge.py",
+      "symbols": [
+        "parse_tabs_from_envelope"
+      ],
+      "lines": "960-991",
+      "summary": "Regex at line 988 extracts tab_id='Tab' instead of '4' from browser-tabs-real.json and cannot parse new_tab 'Opened new tab N at URL'.",
+      "evidence": "Probe 1 returned [{'tab_id': 'Tab', 'url': 'https://antigravity.google.com/remote?project=561adc82-06e6-4c8c-862f-3ac493b947c1', ...}]."
+    },
+    {
+      "id": "R4",
+      "severity": "P0",
+      "file": "bridge/minis_gemini_bridge.py",
+      "symbols": [
+        "DEFAULT_PROJECT_URL",
+        "DEFAULT_EXPECTED_MODEL",
+        "_verify_pre_send_ui"
+      ],
+      "lines": "39-40, 1513-1527",
+      "summary": "Uses wrong project URL (/remote/projects/<id>) and wrong default model ('Pro' vs 'Gemini 4 Neon High'); _verify_pre_send_ui allows visible_text[:1000] to spoof both project and model checks.",
+      "evidence": "Probe 2 passed _verify_pre_send_ui with project_text='WRONG-PROJECT' and model_text='Gemini Ultra Paid Credits' when visible_text mentioned the project ID and 'Pro'."
+    },
+    {
+      "id": "R5",
+      "severity": "P1",
+      "file": "bridge/minis_gemini_bridge.py",
+      "symbols": [
+        "JS_FIND_EDITOR_SNIPPET",
+        "build_inspect_draft_js",
+        "build_status_inspect_js"
+      ],
+      "lines": "994-1015, 1101-1103, 1150-1163",
+      "summary": "DOM selectors mismatch live Antigravity UI, and build_status_inspect_js line 1153 embeds literal \\x08 backspace bytes in the stop/cancel regex via non-raw f-string '\\b'.",
+      "evidence": "Probe 1 confirmed '\\x08' in build_status_inspect_js('probe') is True."
+    },
+    {
+      "id": "R6",
+      "severity": "P1",
+      "file": "bridge/minis_gemini_bridge.py",
+      "symbols": [
+        "AUTH_BLOCK_PATTERNS",
+        "detect_blocking_reason",
+        "classify_ui_status"
+      ],
+      "lines": "97-108, 1287-1305, 1354-1415",
+      "summary": "Misses Google's real 'Verify your account to continue.' error (actively misclassifying it as 'returned' exit 0 when in assistant_messages) while full visible_text regex scanning causes false-positive blocks on legitimate replies mentioning error/auth keywords.",
+      "evidence": "Probe 4: 'Verify your account to continue.' -> classification='returned'; legitimate reply mentioning 'sign in, rate limit, and network error' -> classification='blocked' (identity_or_verification)."
+    }
+  ],
+  "additional_findings": [
+    {
+      "id": "A1",
+      "severity": "P0",
+      "category": "uncertain_send_idempotency",
+      "file": "bridge/minis_gemini_bridge.py",
+      "symbols": [
+        "cmd_submit"
+      ],
+      "lines": "1862-1869",
+      "summary": "Non-structured or tab-id-suffixed post-click response resets state='blocked_before_send' and send_initiated=False, wiping submit_uncertain and allowing automatic double-submit on the next submit call.",
+      "evidence": "Probe 3: after btn.click() returned JSON + '\\n  tab_id: 4', journal reset to state='blocked_before_send', send_initiated=False, and a second submit called btn.click() again (total_click_send_calls=2)."
+    },
+    {
+      "id": "A2",
+      "severity": "P0",
+      "category": "status_contamination",
+      "file": "bridge/minis_gemini_bridge.py",
+      "symbols": [
+        "classify_ui_status",
+        "build_status_inspect_js",
+        "cmd_status",
+        "BrowserUseClient.resolve_official_tab"
+      ],
+      "lines": "1160-1178, 1254-1270, 1388-1405, 1923-1927, 1951-1982",
+      "summary": "Stale assistant messages trigger 'returned' even when marker_in_conversation=False or without DOM turn ordering after the user prompt; prefixed prompt echoes bypass echo filter; cmd_status falls back to another open project tab without navigating and overwrites journal conversation_url; --contract + --attempt uses the contract's attempt marker instead of the requested attempt's marker.",
+      "evidence": "Probe 4: stale_reply_without_marker='returned', prefixed_echo='returned', cmd_status inspected conv-bbb and overwrote attempt 2 conversation_url from conv-aaa to conv-bbb while searching for attempt 1's task_marker."
+    },
+    {
+      "id": "A3",
+      "severity": "P0",
+      "category": "dom_status_and_presend_contamination",
+      "file": "bridge/minis_gemini_bridge.py",
+      "symbols": [
+        "build_inspect_draft_js",
+        "build_status_inspect_js"
+      ],
+      "lines": "1107-1111, 1121-1122, 1164-1168, 1177-1178",
+      "summary": "Reading innerText on detached document.body.cloneNode(true) falls back to textContent in WebKit/Chromium, leaking <script>, <style>, hydration JSON, and hidden modal templates into visible_text and marker_in_conversation; whole-body scan also matches sidebar chat titles.",
+      "evidence": "Static inspection of lines 1107-1111 and 1164-1168: bodyClone is never connected to the DOM before reading bodyClone.innerText, and marker_in_conversation checks nonEditorText.includes(marker) across the whole cloned body."
+    },
+    {
+      "id": "A4",
+      "severity": "P1",
+      "category": "local_path_symlink_safety",
+      "file": "bridge/minis_gemini_bridge.py",
+      "symbols": [
+        "_safe_write_collected_file",
+        "JobJournal.save"
+      ],
+      "lines": "543-552, 2006-2018",
+      "summary": "Symlink escape and arbitrary file overwrite: _safe_write_collected_file allows collect_root symlink escape, follows internal target symlinks to overwrite result.json, and writes predictable .tmp.<pid> files without O_CREAT|O_EXCL|O_NOFOLLOW; JobJournal.save lacks symlink checks, fsync, and file locking.",
+      "evidence": "Probe 8: escaped_via_collect_root_symlink=True, internal_symlink_overwrote_result_json='OVERWRITTEN_VIA_INTERNAL_SYMLINK', tmp_pid_symlink_overwrote_outside_victim='PWNED_VIA_TMP_SYMLINK', journal_escaped_via_jobs_symlink=True."
+    },
+    {
+      "id": "A5",
+      "severity": "P1",
+      "category": "collector_allowlist_and_sanitization",
+      "file": "bridge/minis_gemini_bridge.py",
+      "symbols": [
+        "cmd_collect",
+        "cmd_submit",
+        "validate_result_manifest"
+      ],
+      "lines": "1451-1487, 1748-1754, 2064-2172",
+      "summary": "Collector never inspects git diff/tree on job_branch for unauthorized out-of-scope file modifications; attempt>1 submit only checks prior snapshot existence (not hash) and collect ignores prior snapshots; result.json['tests'] is echoed to stdout without sanitize_text() or size bounds; self-referential commit SHA fields are not rejected.",
+      "evidence": "Probe 7: collect exited 0 (collected_not_accepted) despite '.github/workflows/evil.yml' on job_branch and 'final_commit_sha' in result.json, leaked 'ghp_1234567890abcdef12345678' verbatim in stdout tests, and attempt-2 submit accepted tampered attempt-01/task.json."
+    },
+    {
+      "id": "A6",
+      "severity": "P1",
+      "category": "uncertain_send_restart_idempotency",
+      "file": "bridge/minis_gemini_bridge.py",
+      "symbols": [
+        "cmd_submit",
+        "build_status_inspect_js"
+      ],
+      "lines": "1155, 1673-1680, 1731-1736, 1774-1796, 1809-1828, 1881",
+      "summary": "Post-send marks submitted on running=True (including generic [aria-busy='true']) without marker_in_conversation; pre-send ignores marker_in_conversation=True; fresh state-dir with existing remote attempt-01 snapshot double-submits while agent is running; submit_uncertain reconciles only a single tab.",
+      "evidence": "Probe 5: post-send running=True with marker_in_conversation=False returned exit 0 status='submitted'; Probe 3: pre-send marker_in_conversation=True still clicked send; Probe 9: fresh state-dir with existing remote snapshot submitted again (clicks=1)."
+    },
+    {
+      "id": "A7",
+      "severity": "P1",
+      "category": "mcp_protocol_and_file_parser",
+      "file": "bridge/minis_gemini_bridge.py",
+      "symbols": [
+        "unwrap_mcp_envelope",
+        "_raise_classified_mcp_error",
+        "GitHubMcpClient.get_branch_head_sha",
+        "GitHubMcpClient.get_file_text",
+        "extract_file_text_from_mcp_envelope"
+      ],
+      "lines": "630-691, 709-713, 753-780, 807-829, 850-899",
+      "summary": "_raise_classified_mcp_error maps any 'not found' error (including missing MCP tool/server/repo) to McpNotFoundError swallowed as None; extract_file_text_from_mcp_envelope accepts directory JSON lists and git symlinks as file text, corrupts/rejects valid JSON artifacts with content/sha/path or type=dir keys, and returns status text when data.success=false.",
+      "evidence": "Probe 6: tool_not_found_treated_as_branch_none=True, github_dir_array_returned_as_file_text='[{\"type\": \"file\", \"name\": \"a.py\"}]', github_symlink_returned_as_file_text='/etc/passwd', valid_json_file_mangled_to='INNER_ONLY', mcp_data_success_false_returned_as_file_text='successfully downloaded text file'."
+    },
+    {
+      "id": "A8",
+      "severity": "P2",
+      "category": "immutable_snapshot_and_canonical_hash",
+      "file": "bridge/minis_gemini_bridge.py",
+      "symbols": [
+        "validate_snapshot_matches_contract",
+        "load_and_validate_contract",
+        "cmd_submit"
+      ],
+      "lines": "426-478, 1726-1729, 1761-1771",
+      "summary": "validate_snapshot_matches_contract accepts missing contract_sha256 and tampered task_snapshot_path/result_snapshot_path; load_and_validate_contract accepts duplicate JSON keys; attempt 1 does not check if task_snapshot_path already exists on base_branch before create_file_immutable.",
+      "evidence": "Probe 7: snapshot omitting contract_sha256 with result_snapshot_path='evil/hijacked_result.json' passed; Probe 9: duplicate 'goal' key silently accepted."
+    },
+    {
+      "id": "A9",
+      "severity": "P2",
+      "category": "path_url_cli_and_journal_hardening",
+      "file": "bridge/minis_gemini_bridge.py",
+      "symbols": [
+        "validate_relative_path",
+        "validate_contract_dict",
+        "_safe_write_collected_file",
+        "BrowserUseClient.navigate",
+        "BrowserUseClient.eval_js",
+        "validate_official_url",
+        "JobJournal._strip_forbidden_fields"
+      ],
+      "lines": "178-195, 275, 347-354, 554-565, 1233-1252, 2006-2018, 2124-2136",
+      "summary": "Case-sensitive 'jobs' check allows 'Jobs/...' and case-duplicate paths; file/dir prefix collision ['src/a','src/a/b.py'] causes unhandled FileExistsError crash; collect does not clean stale files on re-collect; --tab-id is unvalidated (allows '--json' flag injection); validate_official_url allows non-default ports, empty-user '@', and '/remote/../signin'; journal leaks 'tab_id: 4' via human_text evidence.",
+      "evidence": "Probes 4, 8, 9 reproduced all six conditions: case_insensitive_jobs_bypass_accepted, prefix_collision_unhandled_oserror='FileExistsError', tab_id_unvalidated_argvs with '--json', bad_urls_accepted (3/3), journal_contains_leaked_tab_id_4=True."
+    },
+    {
+      "id": "A10",
+      "severity": "P3",
+      "category": "docs_and_unverified_mcp_protocol",
+      "file": "bridge/WORKFLOW.md",
+      "symbols": [
+        "WORKFLOW.md"
+      ],
+      "lines": "7, 54",
+      "summary": "WORKFLOW.md still cites outdated URL/Pro model assumptions, and protocol-fixtures.json contains no live minis-mcp-cli fixtures.",
+      "evidence": "Static inspection of bridge/WORKFLOW.md and orchestration/bootstrap/protocol-fixtures.json."
+    }
+  ],
+  "risks": [
+    "Real minis-mcp-cli CLI invocation syntax, GitHub MCP tool/parameter names (perPage vs per_page, ref vs branch, from_branch), create_or_update_file overwrite semantics when sha is omitted, and actual MCP response envelopes remain unverified on iOS Minis.",
+    "Live Antigravity DOM selectors, ClipboardEvent paste fidelity, innerText newline normalization, and Cancel button visibility require live Minis verification after remediating R1-R6 and A1-A9.",
+    "iOS Minis app suspension/filesystem semantics (APFS case-insensitivity, non-fsynced journal rename, concurrent submit races) remain unverified and hazardous until A4 and A9 are fixed."
+  ],
+  "scope_compliance": {
+    "edited_production_code_or_contracts": false,
+    "modified_main_or_created_pr": false,
+    "faked_live_minis_tests": false,
+    "dumped_credentials_or_env": false,
+    "only_authorized_review_files_written": true
+  }
+}
