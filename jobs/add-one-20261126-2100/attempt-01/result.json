@@ -1,0 +1,18 @@
+{
+  "task_id": "add-one-20261126-2100",
+  "attempt": 1,
+  "contract_sha256": "5d6f0cf6862710ed66c3d951677af4afe7c321c1b70dbf228688bf989c5f9696",
+  "status": "completed",
+  "summary": "Verified task contract snapshot contract_sha256, independently answered '1 加 1 等于几？' as integer 2, created and validated examples/add-one-20261126-2100.json, and preserved all non-authorized files unchanged.",
+  "artifacts": [
+    "examples/add-one-20261126-2100.json"
+  ],
+  "tests": [
+    {
+      "command": "python3 -c 'import json; t=json.load(open(\"jobs/add-one-20261126-2100/attempt-01/task.json\")); assert t[\"contract_sha256\"]==\"5d6f0cf6862710ed66c3d951677af4afe7c321c1b70dbf228688bf989c5f9696\"; a=json.load(open(\"examples/add-one-20261126-2100.json\")); assert a=={\"task_id\":\"add-one-20261126-2100\",\"question\":\"1 加 1 等于几？\",\"answer\":2,\"source\":\"Minis GPT dispatch\"} and type(a[\"answer\"]) is int; print(\"PASS: 2/2 checks passed\")'",
+      "passed": 2,
+      "failed": 0,
+      "exit_code": 0
+    }
+  ]
+}
