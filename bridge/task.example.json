@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "repository": "yinanan77/gemini-bridge",
+  "task_id": "example-text-stats-v1",
+  "attempt": 1,
+  "goal": "Implement a small Python 3 standard-library text statistics helper in examples/text_stats.py with unit tests in examples/test_text_stats.py.",
+  "base_branch": "main",
+  "allowed_write_paths": [
+    "examples/text_stats.py",
+    "examples/test_text_stats.py"
+  ],
+  "acceptance": [
+    "Only allowed_write_paths and jobs/example-text-stats-v1/attempt-01/result.json are created or updated on branch gpt-gemini/jobs/example-text-stats-v1.",
+    "python3 -m py_compile examples/text_stats.py exits 0.",
+    "python3 -m unittest discover -s examples -p test_text_stats.py passes all tests."
+  ],
+  "notes": "Example task contract for minis_gemini_bridge.py validate/submit/status/collect."
+}
