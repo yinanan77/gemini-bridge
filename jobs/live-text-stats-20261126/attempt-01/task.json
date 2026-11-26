@@ -1,0 +1,25 @@
+{
+  "acceptance": [
+    "Only the three allowed artifact files and this attempt's required result.json are changed by Gemini; main, README, bridge code, task snapshots and other attempts remain unchanged.",
+    "count_text('') == {'characters':0,'non_whitespace':0,'lines':0,'han_characters':0}; count_text('你好 Gemini!\\n第二行') must follow actual codepoint, whitespace, splitlines and basic-Han definitions rather than approximate word/token counts.",
+    "Tests cover empty input, Chinese+English, whitespace/newlines, CRLF, emoji and non-basic Han, invalid Python input types, valid stdin/file CLI, malformed UTF-8 or missing file handling. python3 -m py_compile examples/text_stats.py and python3 -m unittest discover -s examples -p test_text_stats.py must succeed.",
+    "No third-party packages, credentials, environment dumps, account modifications, paid credits, extra billing, other repositories, services or schedules.",
+    "Push actual code, tests, document and a result manifest with exact task_id/attempt/contract_sha256, status=completed, summary, artifacts listing the three actual paths, and tests={commands:[actual commands],passed:integer,failed:integer}. GPT will independently retrieve bytes from GitHub and run additional tests before accepting."
+  ],
+  "allowed_write_paths": [
+    "examples/TEXT_STATS.md",
+    "examples/test_text_stats.py",
+    "examples/text_stats.py"
+  ],
+  "attempt": 1,
+  "base_branch": "workflow/gpt-gemini-v1",
+  "contract_sha256": "da5057746cada99a5474802e763ccdaffdab87bd9a36c3cc9e70cd906a4f4908",
+  "goal": "Build a small useful Chinese-script text statistics tool using Python 3 standard library only. Implement count_text(text) in examples/text_stats.py returning exactly characters (len of Python str codepoints), non_whitespace (not str.isspace), lines (len(text.splitlines())), and han_characters (only U+4E00..U+9FFF). Empty text has all zero counts. Reject non-str input with TypeError. CLI accepts a UTF-8 file path or '-' for stdin and emits one JSON object with these four integer fields; invalid input/UTF-8/file error must exit nonzero with a concise stderr message, no traceback or network access. Add meaningful unit tests and a concise Chinese usage document. Actually compile and run tests. This is a real code task to verify GPT -> Gemini -> GitHub -> GPT automation, not a connectivity marker. Do not execute or modify the bridge runtime itself.",
+  "job_branch": "gpt-gemini/jobs/live-text-stats-20261126",
+  "notes": "Do not treat your own tests or status words as external acceptance. If blocked, stop and return the real sanitized error; never fake execution. Use only existing subscription allowance.",
+  "repository": "yinanan77/gemini-bridge",
+  "result_snapshot_path": "jobs/live-text-stats-20261126/attempt-01/result.json",
+  "schema_version": 1,
+  "task_id": "live-text-stats-20261126",
+  "task_snapshot_path": "jobs/live-text-stats-20261126/attempt-01/task.json"
+}
