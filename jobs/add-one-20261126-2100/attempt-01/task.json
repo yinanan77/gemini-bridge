@@ -1,0 +1,22 @@
+{
+  "acceptance": [
+    "Gemini 的最终答复包含其独立计算的答案、原问题和任务编号，不是只复述任务计划。",
+    "实际写入并推送 examples/add-one-20261126-2100.json；question 为 1 加 1 等于几？；answer 是整数；source 为 Minis GPT dispatch；task_id 为 add-one-20261126-2100。",
+    "只改变允许文件和本次结果清单，不更改 main、其他任务、README、配置或凭证。",
+    "结果清单包含正确的task_id、attempt、contract_sha256、status、summary、artifacts、tests，且不包含自引用最终提交号。",
+    "不宣称其他Gemini新会话能自动得知任务；GPT将独立回读结果和官方会话，并核对任务上下文。"
+  ],
+  "allowed_write_paths": [
+    "examples/add-one-20261126-2100.json"
+  ],
+  "attempt": 1,
+  "base_branch": "main",
+  "contract_sha256": "5d6f0cf6862710ed66c3d951677af4afe7c321c1b70dbf228688bf989c5f9696",
+  "goal": "用户要求真实测试 GPT 指挥 Gemini，并能亲自到 Gemini 会话追问核实。请你独立回答用户的问题：1 加 1 等于几？把答案用中文直接写在你的最终回复中，同时说明这是用户经 Minis GPT 派给你的任务，给出任务编号和原问题。实际读取本次 GitHub task.json，不猜测其他任务。创建且只创建 examples/add-one-20261126-2100.json，内容为 JSON 对象，字段 task_id（本次任务编号）、question（原问题）、answer（你独立算出的整数）、source（Minis GPT dispatch）。用户会打开本次同一个官方会话问你刚收到的任务是什么，届时应按会话中真实上下文回答；不要声称普通 Gemini App 另一个新聊天会自动共享本会话或 GitHub 的内容。无需编写程序，勿运行不必要命令。写文件和结果清单后提交并推送到任务分支。仅用现有 Pro 订阅，额度不足停止，不开计费或购买积分。",
+  "job_branch": "gpt-gemini/jobs/add-one-20261126-2100",
+  "repository": "yinanan77/gemini-bridge",
+  "result_snapshot_path": "jobs/add-one-20261126-2100/attempt-01/result.json",
+  "schema_version": 1,
+  "task_id": "add-one-20261126-2100",
+  "task_snapshot_path": "jobs/add-one-20261126-2100/attempt-01/task.json"
+}
