@@ -10,15 +10,22 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import contextmanager
 import datetime
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None  # type: ignore[assignment]
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import secrets
+import shutil
 import subprocess
 import sys
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, urlparse
 
 
@@ -161,6 +168,66 @@ def sanitize_text(value: Any, max_len: int = 1000) -> str:
     return text
 
 
+def sanitize_value(
+    obj: Any,
+    *,
+    max_depth: int = 6,
+    max_items: int = 50,
+    max_str_len: int = 500,
+) -> Any:
+    """Recursively sanitize and size-bound untrusted JSON metadata (e.g., model tests)."""
+    if max_depth <= 0:
+        return "[truncated_depth]"
+    if obj is None or isinstance(obj, (bool, int, float)):
+        return obj
+    if isinstance(obj, str):
+        return sanitize_text(obj, max_len=max_str_len)
+    if isinstance(obj, list):
+        bounded = obj[:max_items]
+        out = [
+            sanitize_value(item, max_depth=max_depth - 1, max_items=max_items, max_str_len=max_str_len)
+            for item in bounded
+        ]
+        if len(obj) > max_items:
+            out.append(f"...[{len(obj) - max_items} items truncated]")
+        return out
+    if isinstance(obj, dict):
+        out_dict: Dict[str, Any] = {}
+        items = list(obj.items())
+        for key, val in items[:max_items]:
+            safe_key = sanitize_text(key, max_len=120)
+            out_dict[safe_key] = sanitize_value(
+                val,
+                max_depth=max_depth - 1,
+                max_items=max_items,
+                max_str_len=max_str_len,
+            )
+        if len(items) > max_items:
+            out_dict["_truncated_keys"] = len(items) - max_items
+        return out_dict
+    return sanitize_text(obj, max_len=max_str_len)
+
+
+def loads_json_strict(raw_text: str, error_code: str, label: str) -> Any:
+    """Parse JSON while strictly rejecting duplicate object keys."""
+
+    def _no_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+        obj: Dict[str, Any] = {}
+        for key, val in pairs:
+            if key in obj:
+                raise ValidationError(
+                    f"{error_code}_duplicate_key",
+                    f"Duplicate JSON key '{key}' rejected in {label}.",
+                )
+            obj[key] = val
+        return obj
+
+    try:
+        return json.loads(raw_text, object_pairs_hook=_no_duplicate_keys)
+    except json.JSONDecodeError as exc:
+        raise ValidationError(error_code, f"Invalid JSON in {label}: {exc}") from exc
+
+
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -188,14 +255,27 @@ def validate_official_url(url: str, label: str = "URL") -> str:
     if not isinstance(url, str) or not url.strip():
         raise ValidationError("invalid_url", f"{label} must be a non-empty string.")
     cleaned = url.strip()
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in cleaned):
+        raise ValidationError("invalid_url", f"{label} contains whitespace or control characters.")
     parsed = urlparse(cleaned)
     if parsed.scheme != "https" or parsed.hostname != OFFICIAL_HOST:
         raise ValidationError(
             "non_official_url",
             f"{label} must use https://{OFFICIAL_HOST}/remote.",
         )
-    if parsed.username or parsed.password:
-        raise ValidationError("credential_url", f"{label} must not contain credentials.")
+    if parsed.username or parsed.password or "@" in parsed.netloc:
+        raise ValidationError("credential_url", f"{label} must not contain credentials or '@' authority.")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValidationError("invalid_url", f"{label} has an invalid port.") from exc
+    if port is not None and port != 443:
+        raise ValidationError("non_official_url", f"{label} must not use non-default port {port}.")
+    if "\\" in parsed.path or "//" in parsed.path:
+        raise ValidationError("non_official_url", f"{label} path contains invalid slash syntax.")
+    path_segments = parsed.path.split("/")
+    if any(seg in (".", "..") for seg in path_segments):
+        raise ValidationError("non_official_url", f"{label} path must not contain traversal segments.")
     if not (parsed.path == "/remote" or parsed.path.startswith("/remote/")):
         raise ValidationError(
             "non_official_url",
@@ -305,12 +385,26 @@ def validate_relative_path(raw_path: Any, *, allow_jobs_prefix: bool = False) ->
         raise ValidationError("forbidden_secret_path", f"Sensitive key/certificate suffix rejected: {raw_path}")
     if re.match(r"^workflow.*\.(?:ya?ml)$", filename_low):
         raise ValidationError("forbidden_workflow_path", f"Workflow manifest rejected: {raw_path}")
-    if not allow_jobs_prefix and segments[0] == "jobs":
+    if not allow_jobs_prefix and segments[0].lower() == "jobs":
         raise ValidationError(
             "reserved_snapshot_path",
             f"Path under jobs/ is reserved for bridge snapshots: {raw_path}",
         )
     return raw_path
+
+
+def _check_path_set_collisions(paths: Sequence[str], label: str) -> None:
+    """Reject case-insensitive duplicates and file/directory prefix collisions."""
+    lowered = sorted(p.lower() for p in paths)
+    for i in range(len(lowered)):
+        for j in range(i + 1, len(lowered)):
+            if lowered[i] == lowered[j]:
+                raise ValidationError("duplicate_path", f"Case-colliding duplicate {label} entry.")
+            if lowered[j].startswith(lowered[i] + "/"):
+                raise ValidationError(
+                    "path_prefix_collision",
+                    f"File/directory prefix collision in {label}: '{lowered[i]}' vs '{lowered[j]}'.",
+                )
 
 
 def derive_job_branch(task_id: str) -> str:
@@ -377,14 +471,16 @@ def validate_contract_dict(raw: Any) -> Dict[str, Any]:
     raw_paths = raw["allowed_write_paths"]
     if not isinstance(raw_paths, list) or not raw_paths:
         raise ValidationError("invalid_allowed_write_paths", "allowed_write_paths must be a non-empty list.")
-    seen_paths = set()
+    seen_paths_lower = set()
     allowed_write_paths: List[str] = []
     for item in raw_paths:
         cleaned = validate_relative_path(item, allow_jobs_prefix=False)
-        if cleaned in seen_paths:
-            raise ValidationError("duplicate_path", f"Duplicate allowed_write_paths entry: {cleaned}")
-        seen_paths.add(cleaned)
+        low_path = cleaned.lower()
+        if low_path in seen_paths_lower:
+            raise ValidationError("duplicate_path", f"Duplicate or case-colliding allowed_write_paths entry: {cleaned}")
+        seen_paths_lower.add(low_path)
         allowed_write_paths.append(cleaned)
+    _check_path_set_collisions(allowed_write_paths, "allowed_write_paths")
 
     raw_acceptance = raw["acceptance"]
     if not isinstance(raw_acceptance, list) or not raw_acceptance:
@@ -417,13 +513,13 @@ def validate_contract_dict(raw: Any) -> Dict[str, Any]:
         ctx = raw["context_files"]
         if not isinstance(ctx, list):
             raise ValidationError("invalid_context_files", "context_files must be a list of relative paths.")
-        ctx_seen = set()
+        ctx_seen_lower = set()
         ctx_paths: List[str] = []
         for item in ctx:
             cleaned = validate_relative_path(item, allow_jobs_prefix=True)
-            if cleaned in ctx_seen:
+            if cleaned.lower() in ctx_seen_lower:
                 raise ValidationError("duplicate_context_path", f"Duplicate context_files entry: {cleaned}")
-            ctx_seen.add(cleaned)
+            ctx_seen_lower.add(cleaned.lower())
             ctx_paths.append(cleaned)
         canonical["context_files"] = sorted(ctx_paths)
 
@@ -464,10 +560,7 @@ def load_and_validate_contract(contract_path: str) -> Dict[str, Any]:
         raw_text = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise ValidationError("contract_read_error", f"Failed to read contract: {exc}") from exc
-    try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError as exc:
-        raise ValidationError("malformed_json", f"Invalid JSON in contract: {exc}") from exc
+    parsed = loads_json_strict(raw_text, "malformed_json", "contract")
     return validate_contract_dict(parsed)
 
 
@@ -480,16 +573,28 @@ def build_snapshot_document(validated: Dict[str, Any]) -> str:
     return json.dumps(doc, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
 
 
-def validate_snapshot_matches_contract(snapshot_text: str, expected_sha256: str) -> Dict[str, Any]:
-    """Parse a GitHub task snapshot and confirm its canonical hash matches expected_sha256."""
-    try:
-        parsed = json.loads(snapshot_text)
-    except json.JSONDecodeError as exc:
-        raise ValidationError("malformed_remote_snapshot", f"Remote task snapshot is not valid JSON: {exc}") from exc
+def validate_snapshot_matches_contract(
+    snapshot_text: str,
+    expected_sha256: Optional[str],
+    *,
+    expected_task_id: Optional[str] = None,
+    expected_attempt: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Parse a GitHub task snapshot and strictly confirm integrity, metadata paths, and hash."""
+    parsed = loads_json_strict(snapshot_text, "malformed_remote_snapshot", "remote task snapshot")
     if not isinstance(parsed, dict):
         raise ValidationError("malformed_remote_snapshot", "Remote task snapshot must be a JSON object.")
 
     recorded_hash = parsed.get("contract_sha256")
+    recorded_task_path = parsed.get("task_snapshot_path")
+    recorded_result_path = parsed.get("result_snapshot_path")
+
+    if not isinstance(recorded_hash, str) or not recorded_hash.strip():
+        raise ValidationError(
+            "corrupted_remote_snapshot",
+            "Remote task snapshot is missing required contract_sha256.",
+        )
+
     contract_view = {
         k: v
         for k, v in parsed.items()
@@ -497,12 +602,33 @@ def validate_snapshot_matches_contract(snapshot_text: str, expected_sha256: str)
     }
     revalidated = validate_contract_dict(contract_view)
     computed = revalidated["contract_sha256"]
-    if recorded_hash is not None and recorded_hash != computed:
+
+    if recorded_hash != computed:
         raise ValidationError(
             "corrupted_remote_snapshot",
             "Remote task snapshot contract_sha256 does not match its own canonical content.",
         )
-    if computed != expected_sha256:
+    if recorded_task_path != revalidated["task_snapshot_path"]:
+        raise ValidationError(
+            "corrupted_remote_snapshot",
+            "Remote task snapshot task_snapshot_path is missing or tampered.",
+        )
+    if recorded_result_path != revalidated["result_snapshot_path"]:
+        raise ValidationError(
+            "corrupted_remote_snapshot",
+            "Remote task snapshot result_snapshot_path is missing or tampered.",
+        )
+    if expected_task_id is not None and revalidated["task_id"] != expected_task_id:
+        raise ValidationError(
+            "corrupted_remote_snapshot",
+            "Remote task snapshot task_id does not match expected task_id.",
+        )
+    if expected_attempt is not None and revalidated["attempt"] != expected_attempt:
+        raise ValidationError(
+            "corrupted_remote_snapshot",
+            "Remote task snapshot attempt does not match expected attempt.",
+        )
+    if expected_sha256 is not None and computed != expected_sha256:
         raise ValidationError(
             "contract_conflict",
             "Existing remote task snapshot has a different contract_sha256; refusing to overwrite.",
@@ -549,39 +675,250 @@ def default_subprocess_runner(argv: List[str], timeout: int) -> subprocess.Compl
     )
 
 
+def _fsync_dir(dir_path: Path) -> None:
+    """Best-effort directory fsync after atomic rename."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd: Optional[int] = None
+    try:
+        fd = os.open(str(dir_path), flags)
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _ensure_no_symlink_dir(path: Path, *, create: bool) -> None:
+    """Ensure a single directory path is not a symlink (and create it if requested)."""
+    if path.is_symlink():
+        raise ValidationError("symlink_rejected", f"Refusing to traverse symlink directory: {path.name}")
+    if path.exists():
+        if not path.is_dir():
+            raise ValidationError("invalid_directory", f"Expected directory, found non-directory: {path.name}")
+        return
+    if create:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise BridgeError("filesystem_write_error", f"Failed to create directory '{path.name}': {exc}") from exc
+        if path.is_symlink():
+            raise ValidationError("symlink_rejected", f"Refusing to traverse symlink directory: {path.name}")
+
+
+def _ensure_subtree_no_symlink(
+    base_dir: Path,
+    rel_parts: Sequence[str],
+    *,
+    create_dirs: bool,
+    leaf_is_dir: bool = False,
+) -> Path:
+    """Walk from base_dir through rel_parts rejecting any symlink component along the way."""
+    _ensure_no_symlink_dir(base_dir, create=create_dirs)
+    cur = base_dir
+    for idx, part in enumerate(rel_parts):
+        cur = cur / part
+        is_last = idx == len(rel_parts) - 1
+        if cur.is_symlink():
+            raise ValidationError("symlink_rejected", f"Refusing to traverse or write symlink: {part}")
+        if not is_last or leaf_is_dir:
+            if cur.exists():
+                if not cur.is_dir():
+                    raise ValidationError(
+                        "path_prefix_collision",
+                        f"Cannot create directory over existing non-directory: {part}",
+                    )
+            elif create_dirs:
+                try:
+                    cur.mkdir(exist_ok=False)
+                except FileExistsError:
+                    if cur.is_symlink():
+                        raise ValidationError("symlink_rejected", f"Refusing to traverse symlink: {part}")
+                    if not cur.is_dir():
+                        raise ValidationError(
+                            "path_prefix_collision",
+                            f"Cannot create directory over existing non-directory: {part}",
+                        )
+                except OSError as exc:
+                    raise BridgeError("filesystem_write_error", f"Failed to create directory '{part}': {exc}") from exc
+        else:
+            if cur.exists() and cur.is_dir():
+                raise ValidationError("path_prefix_collision", f"Refusing to overwrite directory as file: {part}")
+    return cur
+
+
+def _atomic_write_text_no_follow(target: Path, content: str, *, mode: int = 0o600) -> None:
+    """Atomically write UTF-8 text via exclusive random temp file (O_EXCL|O_NOFOLLOW) + fsync."""
+    parent = target.parent
+    if parent.is_symlink():
+        raise ValidationError("symlink_rejected", f"Refusing to write inside symlink directory: {parent.name}")
+    if target.is_symlink():
+        raise ValidationError("symlink_rejected", f"Refusing to overwrite symlink target: {target.name}")
+    if target.exists() and target.is_dir():
+        raise ValidationError("path_prefix_collision", f"Refusing to overwrite directory: {target.name}")
+
+    data = content.encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    tmp_path: Optional[Path] = None
+    fd: Optional[int] = None
+    try:
+        for _ in range(8):
+            candidate = parent / f".{target.name}.{secrets.token_hex(12)}.tmp"
+            try:
+                fd = os.open(str(candidate), flags, mode)
+                tmp_path = candidate
+                break
+            except FileExistsError:
+                continue
+        if fd is None or tmp_path is None:
+            raise BridgeError("filesystem_write_error", "Failed to allocate exclusive temporary file.")
+        view = memoryview(data)
+        total = 0
+        while total < len(view):
+            written = os.write(fd, view[total:])
+            if written <= 0:
+                raise OSError("short write to temporary file")
+            total += written
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+
+        if target.is_symlink():
+            raise ValidationError("symlink_rejected", f"Refusing to replace symlink target: {target.name}")
+        os.replace(str(tmp_path), str(target))
+        tmp_path = None
+        _fsync_dir(parent)
+    except BridgeError:
+        raise
+    except OSError as exc:
+        raise BridgeError("filesystem_write_error", f"Atomic write failed for '{target.name}': {exc}") from exc
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def _read_text_no_follow(path: Path) -> str:
+    """Read UTF-8 text refusing to follow a symlink leaf."""
+    if path.is_symlink():
+        raise ValidationError("symlink_rejected", f"Refusing to read symlink: {path.name}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd: Optional[int] = None
+    try:
+        fd = os.open(str(path), flags)
+        chunks: List[bytes] = []
+        while True:
+            buf = os.read(fd, 65536)
+            if not buf:
+                break
+            chunks.append(buf)
+        return b"".join(chunks).decode("utf-8")
+    except OSError as exc:
+        raise BridgeError("filesystem_read_error", f"Failed to read '{path.name}': {exc}") from exc
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 class JobJournal:
-    """Local atomic JSON journal under --state-dir. Never stores permanent tab IDs."""
+    """Local atomic, symlink-safe JSON journal under --state-dir. Never stores permanent tab IDs."""
 
     def __init__(self, state_dir: str) -> None:
         self.state_dir = Path(state_dir)
         self.jobs_dir = self.state_dir / "jobs"
         self.collected_dir = self.state_dir / "collected"
 
+    def _validate_state_dirs(self, *, create_jobs: bool = False, create_collected: bool = False) -> None:
+        _ensure_no_symlink_dir(self.state_dir, create=create_jobs or create_collected)
+        if create_jobs or self.jobs_dir.exists() or self.jobs_dir.is_symlink():
+            _ensure_no_symlink_dir(self.jobs_dir, create=create_jobs)
+        if create_collected or self.collected_dir.exists() or self.collected_dir.is_symlink():
+            _ensure_no_symlink_dir(self.collected_dir, create=create_collected)
+
     def job_path(self, task_id: str) -> Path:
         safe_id = validate_task_id(task_id)
         return self.jobs_dir / f"{safe_id}.json"
 
+    @contextmanager
+    def lock_task(self, task_id: str) -> Iterator[None]:
+        """Acquire a non-blocking advisory lock for task_id to prevent concurrent journal races."""
+        safe_id = validate_task_id(task_id)
+        self._validate_state_dirs(create_jobs=True)
+        lock_path = self.jobs_dir / f".{safe_id}.lock"
+        if lock_path.is_symlink():
+            raise ValidationError("symlink_rejected", f"Refusing to open symlink lock file: {lock_path.name}")
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        fd: Optional[int] = None
+        try:
+            fd = os.open(str(lock_path), flags, 0o600)
+            if fcntl is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    raise BridgeError(
+                        "journal_locked",
+                        f"Another bridge command currently holds the lock for task '{safe_id}'.",
+                    ) from exc
+            yield
+        except BridgeError:
+            raise
+        except OSError as exc:
+            raise BridgeError("journal_lock_error", f"Failed to acquire journal lock: {exc}") from exc
+        finally:
+            if fd is not None:
+                if fcntl is not None:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
     def load(self, task_id: str) -> Optional[Dict[str, Any]]:
-        path = self.job_path(task_id)
+        safe_id = validate_task_id(task_id)
+        if self.state_dir.is_symlink():
+            raise ValidationError("symlink_rejected", "Refusing to read from symlink state_dir.")
+        if self.jobs_dir.is_symlink():
+            raise ValidationError("symlink_rejected", "Refusing to read from symlink jobs directory.")
+        path = self.job_path(safe_id)
+        if path.is_symlink():
+            raise ValidationError("symlink_rejected", f"Refusing to read symlink journal: {path.name}")
         if not path.exists():
             return None
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            raw = _read_text_no_follow(path)
+            data = json.loads(raw)
+        except BridgeError:
+            raise
         except (OSError, json.JSONDecodeError) as exc:
-            raise BridgeError("journal_corrupt", f"Failed to read journal for {task_id}: {exc}") from exc
+            raise BridgeError("journal_corrupt", f"Failed to read journal for {safe_id}: {exc}") from exc
         if not isinstance(data, dict) or not isinstance(data.get("attempts"), dict):
-            raise BridgeError("journal_corrupt", f"Malformed journal structure for {task_id}.")
+            raise BridgeError("journal_corrupt", f"Malformed journal structure for {safe_id}.")
         return data
 
     def save(self, task_id: str, data: Dict[str, Any]) -> Path:
+        safe_id = validate_task_id(task_id)
+        self._validate_state_dirs(create_jobs=True)
         sanitized = self._strip_forbidden_fields(data)
         sanitized["updated_at"] = utc_now_iso()
-        self.jobs_dir.mkdir(parents=True, exist_ok=True)
-        path = self.job_path(task_id)
-        tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+        path = _ensure_subtree_no_symlink(self.state_dir, ["jobs", f"{safe_id}.json"], create_dirs=True)
         payload = json.dumps(sanitized, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-        tmp_path.write_text(payload, encoding="utf-8")
-        os.replace(tmp_path, path)
+        _atomic_write_text_no_follow(path, payload, mode=0o600)
         return path
 
     @classmethod
@@ -660,6 +997,30 @@ class JobJournal:
         attempt_entry["updated_at"] = utc_now_iso()
 
 
+MCP_FATAL_NOT_FOUND_RE = re.compile(
+    r"(?i)\b(?:tool\b[^.\n]*\bnot\s+found|unknown\s+tool|mcp\s+server\b[^.\n]*\bnot\s+found|"
+    r"server\b[^.\n]*\bnot\s+found|repository\s+not\s+found|command\s+not\s+found|"
+    r"executable\s+not\s+found|no\s+such\s+file\s+or\s+directory)\b"
+)
+MCP_RESOURCE_404_RE = re.compile(
+    r"(?i)(?:\b404\b|\bnot\s+found\b|\bno\s+commit\s+found\b|\bbranch\s+not\s+found\b|\bpath\s+not\s+found\b)"
+)
+MCP_STATUS_TEXT_ONLY_RE = re.compile(
+    r"(?i)^\s*successfully\s+(?:downloaded|retrieved|fetched)\s+(?:text|binary)?\s*file(?:\s*\([^)]*\))?\s*$"
+)
+
+
+def _check_mcp_level_errors(obj: Dict[str, Any]) -> None:
+    if (
+        obj.get("ok") is False
+        or obj.get("isError") is True
+        or obj.get("success") is False
+        or (isinstance(obj.get("error"), (str, dict)) and bool(obj.get("error")))
+    ):
+        err_msg = _extract_mcp_error_message(obj)
+        _raise_classified_mcp_error(err_msg)
+
+
 def unwrap_mcp_envelope(raw_stdout: str) -> Dict[str, Any]:
     """Parse minis-mcp-cli JSON output and normalize MCP text/resource envelopes."""
     if not raw_stdout or not raw_stdout.strip():
@@ -671,21 +1032,20 @@ def unwrap_mcp_envelope(raw_stdout: str) -> Dict[str, Any]:
     if not isinstance(parsed, dict):
         return {"raw": parsed, "texts": [], "resources": []}
 
-    if parsed.get("ok") is False or parsed.get("isError") is True:
-        err_msg = _extract_mcp_error_message(parsed)
-        _raise_classified_mcp_error(err_msg)
+    _check_mcp_level_errors(parsed)
 
     inner = parsed
-    for wrapper_key in ("data", "result"):
-        if isinstance(inner.get(wrapper_key), dict):
-            inner = inner[wrapper_key]
-            if inner.get("ok") is False or inner.get("isError") is True:
-                err_msg = _extract_mcp_error_message(inner)
-                _raise_classified_mcp_error(err_msg)
-
-    if isinstance(inner.get("error"), (str, dict)):
-        err_msg = _extract_mcp_error_message(inner)
-        _raise_classified_mcp_error(err_msg)
+    for _ in range(4):
+        progressed = False
+        for wrapper_key in ("data", "result"):
+            candidate = inner.get(wrapper_key)
+            if isinstance(candidate, dict):
+                inner = candidate
+                _check_mcp_level_errors(inner)
+                progressed = True
+                break
+        if not progressed:
+            break
 
     texts: List[str] = []
     resources: List[Dict[str, Any]] = []
@@ -725,12 +1085,14 @@ def unwrap_mcp_envelope(raw_stdout: str) -> Dict[str, Any]:
 
 
 def _extract_mcp_error_message(obj: Dict[str, Any]) -> str:
-    if isinstance(obj.get("error"), str):
+    if isinstance(obj.get("error"), str) and obj["error"].strip():
         return obj["error"]
     if isinstance(obj.get("error"), dict):
         return str(obj["error"].get("message") or obj["error"])
-    if isinstance(obj.get("message"), str):
+    if isinstance(obj.get("message"), str) and obj["message"].strip():
         return obj["message"]
+    if isinstance(obj.get("text"), str) and obj["text"].strip():
+        return obj["text"]
     content = obj.get("content")
     if isinstance(content, list):
         parts = [item.get("text", "") for item in content if isinstance(item, dict) and isinstance(item.get("text"), str)]
@@ -740,8 +1102,9 @@ def _extract_mcp_error_message(obj: Dict[str, Any]) -> str:
 
 
 def _raise_classified_mcp_error(message: str) -> None:
-    low = message.lower()
-    if "404" in low or "not found" in low or "no commit found" in low or "branch not found" in low:
+    if MCP_FATAL_NOT_FOUND_RE.search(message):
+        raise McpError("mcp_tool_error", message)
+    if MCP_RESOURCE_404_RE.search(message):
         raise McpNotFoundError("mcp_not_found", message)
     raise McpError("mcp_tool_error", message)
 
@@ -812,6 +1175,59 @@ class GitHubMcpClient:
             raise McpError("mcp_invalid_sha", f"GitHub MCP did not return a valid 40-hex commit SHA for '{branch}'.")
         return sha
 
+    def list_branch_commits(self, branch: str, *, per_page: int = 20) -> Optional[List[str]]:
+        """Return bounded list of commit SHAs on branch (newest first), or None if unavailable."""
+        bounded = max(1, min(int(per_page), 20))
+        try:
+            env = self.call_tool(
+                "list_commits",
+                {"owner": REPO_OWNER, "repo": REPO_NAME, "sha": branch, "perPage": bounded},
+            )
+        except McpError:
+            return None
+        try:
+            payload = self._extract_json_payload(env)
+        except McpError:
+            return None
+        items = payload.get("commits") if isinstance(payload, dict) else payload
+        if not isinstance(items, list):
+            return None
+        shas: List[str] = []
+        for entry in items:
+            if isinstance(entry, dict) and isinstance(entry.get("sha"), str) and SHA40_RE.match(entry["sha"]):
+                shas.append(entry["sha"])
+        return shas
+
+    def get_commit_changed_files(self, commit_sha: str) -> Optional[List[str]]:
+        """Attempt read-only get_commit to retrieve changed file paths; returns None if unavailable."""
+        if not SHA40_RE.match(commit_sha):
+            return None
+        try:
+            env = self.call_tool(
+                "get_commit",
+                {"owner": REPO_OWNER, "repo": REPO_NAME, "sha": commit_sha},
+            )
+        except McpError:
+            return None
+        try:
+            payload = self._extract_json_payload(env)
+        except McpError:
+            return None
+        if not isinstance(payload, dict) or not isinstance(payload.get("files"), list):
+            return None
+        changed: List[str] = []
+        for fobj in payload["files"]:
+            if not isinstance(fobj, dict):
+                return None
+            fname = fobj.get("filename")
+            if not isinstance(fname, str) or not fname.strip():
+                return None
+            changed.append(fname.strip())
+            prev_name = fobj.get("previous_filename")
+            if isinstance(prev_name, str) and prev_name.strip():
+                changed.append(prev_name.strip())
+        return changed
+
     def create_branch(self, branch: str, from_branch: str) -> Dict[str, Any]:
         if branch == "main" or not branch.startswith("gpt-gemini/jobs/"):
             raise ValidationError("forbidden_branch_mutation", f"Refusing to create non-job branch: {branch}")
@@ -880,54 +1296,110 @@ class GitHubMcpClient:
         raise McpError("mcp_malformed_payload", "Expected JSON payload in GitHub MCP response.")
 
 
+def _looks_like_github_contents_wrapper(obj: Any) -> bool:
+    """Distinguish GitHub REST Contents API objects from arbitrary JSON artifact files."""
+    if not isinstance(obj, dict):
+        return False
+    obj_type = obj.get("type")
+    if obj_type not in ("file", "dir", "symlink", "submodule"):
+        return False
+    has_sha40 = isinstance(obj.get("sha"), str) and bool(SHA40_RE.match(obj["sha"]))
+    has_gh_meta = any(k in obj for k in ("_links", "git_url", "html_url", "download_url", "target", "submodule_git_url"))
+    if obj_type == "file":
+        return isinstance(obj.get("content"), str) and (
+            (obj.get("encoding") == "base64" and (has_sha40 or has_gh_meta or "path" in obj))
+            or (has_sha40 and has_gh_meta)
+        )
+    return has_sha40 or has_gh_meta or ("path" in obj and "name" in obj)
+
+
+def _looks_like_github_directory_listing(obj: Any) -> bool:
+    if not isinstance(obj, list) or not obj:
+        return False
+    return all(
+        isinstance(item, dict)
+        and item.get("type") in ("file", "dir", "symlink", "submodule")
+        and isinstance(item.get("name"), str)
+        and (
+            isinstance(item.get("path"), str)
+            or (isinstance(item.get("sha"), str) and bool(SHA40_RE.match(item["sha"])))
+        )
+        for item in obj
+    )
+
+
+def _decode_github_file_object(obj: Dict[str, Any], expected_path: str) -> str:
+    obj_type = obj.get("type")
+    if obj_type == "dir":
+        raise McpError("mcp_unexpected_directory", f"Expected file, got directory for {expected_path}.")
+    if obj_type != "file":
+        raise McpError(
+            "mcp_unexpected_file_type",
+            f"Expected regular file, got type='{obj_type}' for {expected_path}.",
+        )
+    content = obj.get("content")
+    if not isinstance(content, str):
+        raise McpError("mcp_missing_file_content", f"GitHub file object missing content for {expected_path}.")
+    if obj.get("encoding") == "base64":
+        raw_b64 = "".join(content.split())
+        try:
+            return base64.b64decode(raw_b64, validate=True).decode("utf-8")
+        except Exception as exc:
+            raise McpError(
+                "mcp_invalid_file_base64",
+                f"Failed to decode base64 file content for {expected_path}: {exc}",
+            ) from exc
+    return content
+
+
 def extract_file_text_from_mcp_envelope(env: Dict[str, Any], expected_path: str) -> str:
-    """Extract real file text from either MCP resource or text/GitHub Contents API envelopes."""
+    """Extract real file text strictly, rejecting directories, symlinks, submodules, and status-only text."""
     resources = env.get("resources", [])
     if resources:
-        text = resources[0].get("text")
+        if len(resources) > 1:
+            raise McpError("mcp_ambiguous_resources", f"Multiple resource items returned for {expected_path}.")
+        res = resources[0]
+        mime = str(res.get("mimeType") or "").lower()
+        if "directory" in mime or "symlink" in mime:
+            raise McpError("mcp_unexpected_file_type", f"Unexpected resource mimeType '{mime}' for {expected_path}.")
+        text = res.get("text")
         if isinstance(text, str):
             return text
         raise McpError("mcp_malformed_resource", f"Missing text in resource envelope for {expected_path}.")
 
     texts = env.get("texts", [])
     if texts:
-        # Prefer a GitHub Contents API JSON wrapper if present
         for candidate in texts:
+            if MCP_STATUS_TEXT_ONLY_RE.match(candidate):
+                continue
             try:
                 parsed = json.loads(candidate)
             except json.JSONDecodeError:
                 continue
-            if isinstance(parsed, dict) and parsed.get("type") == "dir":
-                raise McpError("mcp_unexpected_directory", f"Expected file, got directory for {expected_path}.")
-            if isinstance(parsed, dict) and isinstance(parsed.get("content"), str) and (
-                parsed.get("encoding") == "base64" or ("sha" in parsed and "path" in parsed)
-            ):
-                if parsed.get("encoding") == "base64":
-                    raw_b64 = "".join(parsed["content"].split())
-                    try:
-                        return base64.b64decode(raw_b64, validate=True).decode("utf-8")
-                    except Exception as exc:
-                        raise McpError(
-                            "mcp_invalid_file_base64",
-                            f"Failed to decode base64 file content for {expected_path}: {exc}",
-                        ) from exc
-                return parsed["content"]
-        # Otherwise, if text looks like a GitHub error string, fail closed
-        joined = texts[-1]
+            if _looks_like_github_directory_listing(parsed):
+                raise McpError("mcp_unexpected_directory", f"Expected file, got directory listing for {expected_path}.")
+            if _looks_like_github_contents_wrapper(parsed):
+                return _decode_github_file_object(parsed, expected_path)
+
+        non_status = [t for t in texts if not MCP_STATUS_TEXT_ONLY_RE.match(t)]
+        if not non_status:
+            raise McpError(
+                "mcp_missing_file_content",
+                f"MCP returned only status text without file content for {expected_path}.",
+            )
+        joined = non_status[-1]
+        if MCP_FATAL_NOT_FOUND_RE.search(joined):
+            raise McpError("mcp_tool_error", joined)
         low = joined.lower()
         if "404" in low and "not found" in low:
             raise McpNotFoundError("mcp_not_found", joined)
         return joined
 
     raw = env.get("raw")
-    if isinstance(raw, dict) and isinstance(raw.get("content"), str):
-        if raw.get("encoding") == "base64":
-            raw_b64 = "".join(raw["content"].split())
-            try:
-                return base64.b64decode(raw_b64, validate=True).decode("utf-8")
-            except Exception as exc:
-                raise McpError("mcp_invalid_file_base64", f"Invalid base64 content: {exc}") from exc
-        return raw["content"]
+    if _looks_like_github_directory_listing(raw):
+        raise McpError("mcp_unexpected_directory", f"Expected file, got directory listing for {expected_path}.")
+    if _looks_like_github_contents_wrapper(raw):
+        return _decode_github_file_object(raw, expected_path)
 
     raise McpError("mcp_missing_file_content", f"No file content found in MCP response for {expected_path}.")
 
@@ -1539,6 +2011,35 @@ def _select_relevant_assistant_messages(
     return marker_in_conv, user_messages, assistant_messages
 
 
+def _is_prompt_echo(msg: str, user_messages: Sequence[str], task_marker: Optional[str]) -> bool:
+    stripped = msg.strip()
+    if not stripped:
+        return True
+    user_norm = [u.strip() for u in user_messages if u.strip()]
+    if stripped in set(user_norm):
+        return True
+    for u in user_norm:
+        prefix = u[:120]
+        if len(prefix) >= 40 and prefix in stripped and len(stripped) <= len(u) + 120:
+            return True
+    if task_marker and task_marker in stripped:
+        if stripped.startswith(f"[{task_marker}]"):
+            return True
+        if re.match(r"(?i)^(?:echo|prompt|received|copy|task)\s*[:\-]?\s*\[" + re.escape(task_marker), stripped):
+            return True
+        if "Immutable task contract snapshot:" in stripped or "Authorized artifact files ONLY:" in stripped:
+            return True
+        if len(stripped) <= len(task_marker) + 48:
+            return True
+    return False
+
+
+def _clean_evidence_text(text: str, max_len: int = 500) -> str:
+    no_suffix, _ = _strip_tab_id_suffix(text)
+    cleaned = re.sub(r"(?im)^[ \t]*tab_id:[ \t]*[0-9]+[ \t]*$", "", no_suffix).strip()
+    return sanitize_text(cleaned, max_len=max_len)
+
+
 def classify_ui_status(
     ui_envelope: Dict[str, Any],
     *,
@@ -1576,17 +2077,18 @@ def classify_ui_status(
         scoped_texts = dialog_texts + relevant_assistant
         evidence_fallback = "; ".join(error_banners or dialog_texts or relevant_assistant[-1:]) or "No assistant response yet."
     elif isinstance(human_text, str) and human_text.strip():
-        url_match = OFFICIAL_URL_IN_TEXT_RE.search(human_text)
+        clean_human, _ = _strip_tab_id_suffix(human_text)
+        url_match = OFFICIAL_URL_IN_TEXT_RE.search(clean_human)
         url = url_match.group(0) if url_match else (env_page_url or fallback_url or "")
-        running = bool(re.search(r"(?i)\b(?:running\s*[:=]\s*true|generating|cancel\s*\(ctrl\+d\)|in\s+progress)\b", human_text))
+        running = bool(re.search(r"(?i)\b(?:running\s*[:=]\s*true|generating|cancel\s*\(ctrl\+d\)|in\s+progress)\b", clean_human))
         error_banners = []
-        if re.search(r"(?i)\b(?:error\s*:|failed\s*:|exception\s*:|status\s*[:=]\s*(?:error|blocked|failed))\b", human_text):
-            error_banners.append(sanitize_text(human_text, max_len=240))
+        if re.search(r"(?i)\b(?:error\s*:|failed\s*:|exception\s*:|status\s*[:=]\s*(?:error|blocked|failed))\b", clean_human):
+            error_banners.append(_clean_evidence_text(clean_human, max_len=240))
         user_messages = []
         relevant_assistant = []
-        scoped_texts = [human_text]
-        marker_in_conv = bool(task_marker) and task_marker in human_text
-        evidence_fallback = human_text
+        scoped_texts = [clean_human]
+        marker_in_conv = bool(task_marker) and task_marker in clean_human
+        evidence_fallback = clean_human
     else:
         return {
             "classification": "blocked",
@@ -1607,7 +2109,7 @@ def classify_ui_status(
             "running": running,
             "marker_in_conversation": marker_in_conv,
             "accepted": False,
-            "evidence": sanitize_text("; ".join(error_banners) or evidence_fallback, max_len=500),
+            "evidence": _clean_evidence_text("; ".join(error_banners) or evidence_fallback, max_len=500),
         }
 
     if not running and blocker is not None:
@@ -1618,7 +2120,7 @@ def classify_ui_status(
             "running": False,
             "marker_in_conversation": marker_in_conv,
             "accepted": False,
-            "evidence": sanitize_text("; ".join(error_banners) or evidence_fallback, max_len=500),
+            "evidence": _clean_evidence_text("; ".join(error_banners) or evidence_fallback, max_len=500),
         }
 
     if running:
@@ -1629,16 +2131,23 @@ def classify_ui_status(
             "running": True,
             "marker_in_conversation": marker_in_conv,
             "accepted": False,
-            "evidence": sanitize_text(evidence_fallback, max_len=400),
+            "evidence": _clean_evidence_text(evidence_fallback, max_len=400),
         }
 
-    # Not running and no error banners: require genuine assistant response AFTER task_marker distinct from prompt echo
-    user_norm = {u.strip() for u in user_messages if u.strip()}
+    # Not running and no error banners: require verified marker (when given) AND genuine assistant response distinct from prompt echo
+    if task_marker and not marker_in_conv:
+        return {
+            "classification": "blocked",
+            "reason": "task_marker_not_found",
+            "url": sanitize_text(url, max_len=300),
+            "running": False,
+            "marker_in_conversation": False,
+            "accepted": False,
+            "evidence": "Expected attempt task_marker not present in official conversation.",
+        }
+
     distinct_assistant = [
-        msg
-        for msg in relevant_assistant
-        if msg.strip() not in user_norm
-        and (not task_marker or not msg.strip().startswith(f"[{task_marker}]"))
+        msg for msg in relevant_assistant if not _is_prompt_echo(msg, user_messages, task_marker)
     ]
     if distinct_assistant:
         return {
@@ -1648,7 +2157,7 @@ def classify_ui_status(
             "running": False,
             "marker_in_conversation": marker_in_conv,
             "accepted": False,
-            "evidence": sanitize_text(distinct_assistant[-1], max_len=500),
+            "evidence": _clean_evidence_text(distinct_assistant[-1], max_len=500),
         }
 
     return {
@@ -1658,18 +2167,32 @@ def classify_ui_status(
         "running": False,
         "marker_in_conversation": marker_in_conv,
         "accepted": False,
-        "evidence": sanitize_text(evidence_fallback, max_len=400),
+        "evidence": _clean_evidence_text(evidence_fallback, max_len=400),
     }
+
+
+FORBIDDEN_SELF_REFERENTIAL_RESULT_KEYS = {
+    "commit",
+    "commit_sha",
+    "final_commit_sha",
+    "head_sha",
+    "git_sha",
+    "sha",
+}
 
 
 def validate_result_manifest(raw_text: str, validated_contract: Dict[str, Any]) -> Dict[str, Any]:
     """Validate attempt result.json strictly against contract identity, hash, and artifact allowlist."""
-    try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError as exc:
-        raise ValidationError("malformed_result_json", f"result.json is not valid JSON: {exc}") from exc
+    parsed = loads_json_strict(raw_text, "malformed_result_json", "result.json")
     if not isinstance(parsed, dict):
         raise ValidationError("malformed_result_json", "result.json must be a JSON object.")
+
+    forbidden_sha_keys = sorted(k for k in parsed.keys() if k.lower() in FORBIDDEN_SELF_REFERENTIAL_RESULT_KEYS)
+    if forbidden_sha_keys:
+        raise ValidationError(
+            "self_referential_commit_sha",
+            f"result.json must not include self-referential commit SHA field(s): {', '.join(forbidden_sha_keys)}.",
+        )
 
     required = ("task_id", "attempt", "contract_sha256", "status", "summary", "artifacts", "tests")
     missing = [k for k in required if k not in parsed]
@@ -1698,6 +2221,7 @@ def validate_result_manifest(raw_text: str, validated_contract: Dict[str, Any]) 
     tests = parsed["tests"]
     if not isinstance(tests, (dict, list)) or len(tests) == 0:
         raise ValidationError("invalid_result_tests", "result.json tests must be a non-empty object or list.")
+    sanitized_tests = sanitize_value(tests)
 
     raw_artifacts = parsed["artifacts"]
     if not isinstance(raw_artifacts, list):
@@ -1706,19 +2230,20 @@ def validate_result_manifest(raw_text: str, validated_contract: Dict[str, Any]) 
         raise ValidationError("empty_result_artifacts", "Completed result must declare at least one artifact.")
 
     allowlist = set(validated_contract["allowed_write_paths"])
-    seen = set()
+    seen_lower = set()
     validated_artifacts: List[str] = []
     for item in raw_artifacts:
         cleaned = validate_relative_path(item, allow_jobs_prefix=False)
-        if cleaned in seen:
+        if cleaned.lower() in seen_lower:
             raise ValidationError("duplicate_result_artifact", f"Duplicate artifact in result.json: {cleaned}")
         if cleaned not in allowlist:
             raise ValidationError(
                 "artifact_out_of_scope",
                 f"Artifact '{cleaned}' is outside contract allowed_write_paths.",
             )
-        seen.add(cleaned)
+        seen_lower.add(cleaned.lower())
         validated_artifacts.append(cleaned)
+    _check_path_set_collisions(validated_artifacts, "result.artifacts")
 
     return {
         "task_id": parsed["task_id"],
@@ -1727,10 +2252,7 @@ def validate_result_manifest(raw_text: str, validated_contract: Dict[str, Any]) 
         "status": status,
         "summary": sanitize_text(summary, max_len=1000),
         "artifacts": validated_artifacts,
-        "tests": tests,
-        "has_self_referential_commit_sha": any(
-            k in parsed for k in ("commit_sha", "final_commit_sha", "head_sha")
-        ),
+        "tests": sanitized_tests,
     }
 
 
@@ -1818,6 +2340,185 @@ def _verify_pre_send_ui(
     return parsed
 
 
+def _is_specific_conversation_url(url: Optional[str]) -> bool:
+    if not isinstance(url, str) or not url.strip():
+        return False
+    try:
+        cleaned = validate_official_url(url, "conversation URL")
+    except ValidationError:
+        return False
+    path = urlparse(cleaned).path.rstrip("/")
+    return path.startswith("/remote/") and len(path) > len("/remote/")
+
+
+def _find_marker_across_official_tabs(
+    browser: BrowserUseClient,
+    task_marker: str,
+    *,
+    tab_id_override: Optional[str],
+    preferred_url: Optional[str],
+    max_tabs: int = 20,
+) -> Optional[Dict[str, Any]]:
+    """Bounded read-only scan across open official tabs for an attempt's exact task_marker."""
+    if tab_id_override is not None:
+        safe_tid = validate_tab_id(tab_id_override)
+        ui_env = browser.eval_js(safe_tid, build_status_inspect_js(task_marker))
+        status_info = classify_ui_status(ui_env, task_marker=task_marker, fallback_url=preferred_url)
+        if status_info.get("marker_in_conversation"):
+            return status_info
+        return None
+
+    tabs = browser.list_tabs()
+    official_tabs: List[Dict[str, str]] = []
+    for tab in tabs:
+        try:
+            validate_official_url(tab["url"], "tab URL")
+            official_tabs.append(tab)
+        except ValidationError:
+            continue
+
+    pref_path = urlparse(preferred_url).path.rstrip("/") if _is_specific_conversation_url(preferred_url) else None
+
+    def _priority(tab: Dict[str, str]) -> Tuple[int, int]:
+        if preferred_url and tab["url"] == preferred_url:
+            return (0, 0)
+        if pref_path and urlparse(tab["url"]).path.rstrip("/") == pref_path:
+            return (1, 0)
+        if extract_url_project_id(tab["url"]) == OFFICIAL_PROJECT_ID:
+            return (2, 0)
+        return (3, 0)
+
+    ordered = sorted(official_tabs, key=_priority)[:max_tabs]
+    for tab in ordered:
+        try:
+            ui_env = browser.eval_js(tab["tab_id"], build_status_inspect_js(task_marker))
+        except BrowserError:
+            continue
+        status_info = classify_ui_status(ui_env, task_marker=task_marker, fallback_url=tab["url"])
+        if status_info.get("marker_in_conversation"):
+            return status_info
+    return None
+
+
+def _verify_prior_task_snapshots(
+    mcp: GitHubMcpClient,
+    job: Optional[Dict[str, Any]],
+    task_id: str,
+    attempt: int,
+    ref: str,
+) -> List[Dict[str, Any]]:
+    """Validate all prior attempt-01..attempt-(N-1) immutable task snapshots on GitHub."""
+    verified: List[Dict[str, Any]] = []
+    journal_attempts = job.get("attempts", {}) if isinstance(job, dict) else {}
+    for prev_attempt in range(1, attempt):
+        prev_task_path, _ = derive_snapshot_paths(task_id, prev_attempt)
+        prev_text = mcp.get_file_text(prev_task_path, ref)
+        if prev_text is None:
+            raise ValidationError(
+                "missing_prior_snapshot",
+                f"Attempt {attempt} requires preserved prior snapshot '{prev_task_path}' on GitHub.",
+            )
+        expected_hash: Optional[str] = None
+        if isinstance(journal_attempts.get(str(prev_attempt)), dict):
+            expected_hash = journal_attempts[str(prev_attempt)].get("contract_sha256")
+        revalidated = validate_snapshot_matches_contract(
+            prev_text,
+            expected_hash,
+            expected_task_id=task_id,
+            expected_attempt=prev_attempt,
+        )
+        verified.append(revalidated)
+    return verified
+
+
+def _check_branch_write_scope(
+    mcp: GitHubMcpClient,
+    validated: Dict[str, Any],
+    head_sha: str,
+    prior_snapshots: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Bounded branch changed-files audit using list_commits + get_commit; returns scope_unverified if unavailable."""
+    base_head = mcp.get_branch_head_sha(validated["base_branch"])
+    if not base_head:
+        return {
+            "status": "scope_unverified",
+            "verified": False,
+            "reason": "base_branch_head_unavailable",
+            "checked_commits": 0,
+            "changed_files": [],
+        }
+    if head_sha == base_head:
+        return {
+            "status": "verified",
+            "verified": True,
+            "reason": "no_commits_ahead_of_base",
+            "checked_commits": 0,
+            "changed_files": [],
+        }
+
+    commits = mcp.list_branch_commits(validated["job_branch"], per_page=20)
+    if not commits:
+        return {
+            "status": "scope_unverified",
+            "verified": False,
+            "reason": "branch_commit_list_unavailable",
+            "checked_commits": 0,
+            "changed_files": [],
+        }
+
+    ahead: List[str] = []
+    reached_base = False
+    for c_sha in commits:
+        if c_sha == base_head:
+            reached_base = True
+            break
+        ahead.append(c_sha)
+
+    if not reached_base or not ahead:
+        return {
+            "status": "scope_unverified",
+            "verified": False,
+            "reason": "base_commit_not_reached_in_bounded_window",
+            "checked_commits": 0,
+            "changed_files": [],
+        }
+
+    changed_files: set[str] = set()
+    checked = 0
+    for c_sha in ahead:
+        files = mcp.get_commit_changed_files(c_sha)
+        if files is None:
+            return {
+                "status": "scope_unverified",
+                "verified": False,
+                "reason": "commit_files_unavailable_via_mcp",
+                "checked_commits": checked,
+                "changed_files": [],
+            }
+        checked += 1
+        changed_files.update(files)
+
+    allowed_branch_paths = set(validated["effective_allowed_paths"])
+    for prev in prior_snapshots:
+        allowed_branch_paths.update(prev["effective_allowed_paths"])
+
+    unauthorized = sorted(p for p in changed_files if p not in allowed_branch_paths)
+    if unauthorized:
+        raise ValidationError(
+            "out_of_scope_branch_change",
+            f"Job branch '{validated['job_branch']}' modified unauthorized file(s): {', '.join(unauthorized[:10])}",
+            details={"unauthorized_files": unauthorized[:20]},
+        )
+
+    return {
+        "status": "verified",
+        "verified": True,
+        "reason": "all_commits_within_allowed_scope",
+        "checked_commits": checked,
+        "changed_files": sorted(changed_files),
+    }
+
+
 def cmd_validate(args: argparse.Namespace) -> Tuple[int, Dict[str, Any]]:
     validated = load_and_validate_contract(args.contract)
     return 0, {
@@ -1890,7 +2591,7 @@ def cmd_submit(
             "project_url": project_url,
             "planned_github_actions": [
                 f"check branch {job_branch}",
-                f"create branch {job_branch} from {validated['base_branch']} (attempt 1 only)" if attempt == 1 else f"verify existing branch {job_branch} and prior snapshot",
+                f"create branch {job_branch} from {validated['base_branch']} (attempt 1 only)" if attempt == 1 else f"verify existing branch {job_branch} and all prior snapshots",
                 f"persist immutable snapshot {task_snapshot_path}",
             ],
             "planned_browser_actions": [
@@ -1906,69 +2607,18 @@ def cmd_submit(
     mcp = mcp_client or GitHubMcpClient(args.mcp_bin, args.mcp_server, timeout)
     browser = browser_client or BrowserUseClient(args.browser_bin, timeout)
 
-    job = journal.ensure_job(validated)
-    attempt_entry = journal.ensure_attempt(job, validated)
+    with journal.lock_task(task_id):
+        job = journal.ensure_job(validated)
+        had_local_attempt_before = str(attempt) in job.get("attempts", {})
+        attempt_entry = journal.ensure_attempt(job, validated)
 
-    # Idempotency & uncertain-state reconciliation BEFORE touching GitHub writes or sending
-    if attempt_entry["state"] in ("submitted", "collected_not_accepted"):
-        return 0, {
-            "command": "submit",
-            "status": "already_submitted",
-            "sent": False,
-            "reconciled": False,
-            "task_id": task_id,
-            "attempt": attempt,
-            "job_branch": job_branch,
-            "contract_sha256": contract_sha256,
-            "task_marker": task_marker,
-            "conversation_url": attempt_entry.get("conversation_url"),
-        }
-
-    if attempt_entry["state"] == "submit_uncertain" or attempt_entry.get("send_initiated") is True:
-        # Never automatically double-submit: reconcile via GitHub result or official conversation UI
-        remote_head = mcp.get_branch_head_sha(job_branch)
-        if remote_head:
-            existing_res = mcp.get_file_text(result_snapshot_path, remote_head)
-            if existing_res is not None:
-                attempt_entry["state"] = "submitted"
-                attempt_entry["updated_at"] = utc_now_iso()
-                journal.save(task_id, job)
-                return 0, {
-                    "command": "submit",
-                    "status": "reconciled_already_submitted",
-                    "sent": False,
-                    "reconciled": True,
-                    "reconciled_via": "github_result_snapshot",
-                    "task_id": task_id,
-                    "attempt": attempt,
-                    "job_branch": job_branch,
-                    "contract_sha256": contract_sha256,
-                    "task_marker": task_marker,
-                }
-
-        reconcile_url = attempt_entry.get("conversation_url") or project_url
-        tab_id = browser.resolve_official_tab(
-            tab_id_override=args.tab_id,
-            target_url=reconcile_url,
-            navigate_to_target=False,
-        )
-        ui_env = browser.eval_js(tab_id, build_status_inspect_js(task_marker))
-        status_info = classify_ui_status(ui_env, task_marker=task_marker, fallback_url=reconcile_url)
-        if status_info.get("marker_in_conversation"):
-            if status_info.get("url"):
-                try:
-                    attempt_entry["conversation_url"] = validate_official_url(status_info["url"])
-                except ValidationError:
-                    pass
-            attempt_entry["state"] = "submitted"
-            attempt_entry["updated_at"] = utc_now_iso()
-            journal.save(task_id, job)
+        # Idempotency & uncertain-state reconciliation BEFORE touching GitHub writes or sending
+        if attempt_entry["state"] in ("submitted", "collected_not_accepted"):
             return 0, {
                 "command": "submit",
-                "status": "reconciled_already_submitted",
+                "status": "already_submitted",
                 "sent": False,
-                "reconciled": True,
-                "reconciled_via": "official_conversation_marker",
+                "reconciled": False,
                 "task_id": task_id,
                 "attempt": attempt,
                 "job_branch": job_branch,
@@ -1977,221 +2627,385 @@ def cmd_submit(
                 "conversation_url": attempt_entry.get("conversation_url"),
             }
 
-        journal.record_error(
-            attempt_entry,
-            "submit_reconcile",
-            "Previous send attempt is uncertain and task marker was not confirmed; refusing automatic double submit.",
-        )
-        journal.save(task_id, job)
-        return 3, {
-            "command": "submit",
-            "status": "uncertain_no_double_submit",
-            "sent": False,
-            "reconciled": False,
-            "task_id": task_id,
-            "attempt": attempt,
-            "job_branch": job_branch,
-            "contract_sha256": contract_sha256,
-            "task_marker": task_marker,
-            "error": "Previous send attempt is uncertain; refusing to double-send. Inspect conversation or create attempt+1.",
-        }
+        if attempt_entry["state"] == "submit_uncertain" or attempt_entry.get("send_initiated") is True:
+            remote_head = mcp.get_branch_head_sha(job_branch)
+            if remote_head:
+                existing_res = mcp.get_file_text(result_snapshot_path, remote_head)
+                if existing_res is not None:
+                    attempt_entry["state"] = "submitted"
+                    attempt_entry["updated_at"] = utc_now_iso()
+                    journal.save(task_id, job)
+                    return 0, {
+                        "command": "submit",
+                        "status": "reconciled_already_submitted",
+                        "sent": False,
+                        "reconciled": True,
+                        "reconciled_via": "github_result_snapshot",
+                        "task_id": task_id,
+                        "attempt": attempt,
+                        "job_branch": job_branch,
+                        "contract_sha256": contract_sha256,
+                        "task_marker": task_marker,
+                    }
 
-    # Step 1: GitHub branch & immutable task snapshot sync/reconciliation
-    branch_head = mcp.get_branch_head_sha(job_branch)
-    if attempt == 1:
-        if branch_head is None:
-            mcp.create_branch(job_branch, validated["base_branch"])
-            attempt_entry["branch_created"] = True
-            journal.save(task_id, job)
-        else:
-            existing_snapshot = mcp.get_file_text(task_snapshot_path, branch_head)
-            if existing_snapshot is not None:
-                validate_snapshot_matches_contract(existing_snapshot, contract_sha256)
-                attempt_entry["branch_created"] = True
-                attempt_entry["task_snapshot_written"] = True
+            reconcile_url = attempt_entry.get("conversation_url") or project_url
+            found_status = _find_marker_across_official_tabs(
+                browser,
+                task_marker,
+                tab_id_override=args.tab_id,
+                preferred_url=reconcile_url,
+            )
+            if found_status is not None and found_status.get("marker_in_conversation"):
+                if found_status.get("url"):
+                    try:
+                        attempt_entry["conversation_url"] = validate_official_url(found_status["url"])
+                    except ValidationError:
+                        pass
+                attempt_entry["state"] = "submitted"
+                attempt_entry["updated_at"] = utc_now_iso()
                 journal.save(task_id, job)
-            elif not attempt_entry.get("branch_created"):
-                raise ValidationError(
-                    "job_branch_already_exists",
-                    f"Job branch '{job_branch}' already exists on GitHub without matching attempt-01 snapshot.",
-                )
-    else:
-        if branch_head is None:
-            raise ValidationError(
-                "missing_job_branch",
-                f"Attempt {attempt} requires existing GitHub job branch '{job_branch}'.",
+                return 0, {
+                    "command": "submit",
+                    "status": "reconciled_already_submitted",
+                    "sent": False,
+                    "reconciled": True,
+                    "reconciled_via": "official_conversation_marker",
+                    "task_id": task_id,
+                    "attempt": attempt,
+                    "job_branch": job_branch,
+                    "contract_sha256": contract_sha256,
+                    "task_marker": task_marker,
+                    "conversation_url": attempt_entry.get("conversation_url"),
+                }
+
+            journal.record_error(
+                attempt_entry,
+                "submit_reconcile",
+                "Previous send attempt is uncertain and task marker was not confirmed; refusing automatic double submit.",
             )
-        prev_task_path, _ = derive_snapshot_paths(task_id, attempt - 1)
-        prev_snapshot = mcp.get_file_text(prev_task_path, branch_head)
-        if prev_snapshot is None:
-            raise ValidationError(
-                "missing_prior_snapshot",
-                f"Attempt {attempt} requires preserved prior snapshot '{prev_task_path}' on GitHub.",
-            )
-        existing_snapshot = mcp.get_file_text(task_snapshot_path, branch_head)
-        if existing_snapshot is not None:
-            validate_snapshot_matches_contract(existing_snapshot, contract_sha256)
-            attempt_entry["task_snapshot_written"] = True
             journal.save(task_id, job)
-
-    if not attempt_entry.get("task_snapshot_written"):
-        snapshot_content = build_snapshot_document(validated)
-        mcp.create_file_immutable(
-            branch=job_branch,
-            path=task_snapshot_path,
-            content=snapshot_content,
-            message=f"chore(bridge): persist immutable task snapshot {task_id} attempt-{attempt:02d}",
-        )
-        attempt_entry["task_snapshot_written"] = True
-        attempt_entry["state"] = "github_synced"
-        journal.save(task_id, job)
-
-    # Check if result already exists on GitHub before touching browser
-    current_head = mcp.get_branch_head_sha(job_branch)
-    if current_head and mcp.get_file_text(result_snapshot_path, current_head) is not None:
-        attempt_entry["state"] = "submitted"
-        journal.save(task_id, job)
-        return 0, {
-            "command": "submit",
-            "status": "reconciled_already_submitted",
-            "sent": False,
-            "reconciled": True,
-            "reconciled_via": "github_result_snapshot",
-            "task_id": task_id,
-            "attempt": attempt,
-            "job_branch": job_branch,
-            "contract_sha256": contract_sha256,
-            "task_marker": task_marker,
-        }
-
-    # Step 2: Official browser UI navigation -> focus+selectAll -> paste -> separate inspect
-    tab_id = browser.resolve_official_tab(
-        tab_id_override=args.tab_id,
-        target_url=project_url,
-        navigate_to_target=True,
-    )
-
-    try:
-        focus_env = browser.eval_js(tab_id, JS_FOCUS_SELECT_ALL)
-        focus_parsed = focus_env.get("parsed")
-        if not isinstance(focus_parsed, dict) or not focus_parsed.get("ok"):
-            raise BrowserError("focus_select_failed", "Failed to focus prompt editor and run execCommand(selectAll).")
-
-        paste_env = browser.eval_js(tab_id, build_paste_js(prompt_text))
-        paste_parsed = paste_env.get("parsed")
-        if not isinstance(paste_parsed, dict) or not paste_parsed.get("dispatched"):
-            raise BrowserError("paste_dispatch_failed", "Failed to dispatch ClipboardEvent paste.")
-
-        inspect_env = browser.eval_js(tab_id, build_inspect_draft_js(task_marker))
-        inspected = _verify_pre_send_ui(
-            inspect_env,
-            expected_prompt=prompt_text,
-            expected_project=args.expected_project,
-            expected_model=args.expected_model,
-        )
-    except BridgeError as exc:
-        attempt_entry["state"] = "blocked_before_send"
-        journal.record_error(attempt_entry, "pre_send", exc.message)
-        journal.save(task_id, job)
-        raise
-
-    # Step 3: Journal uncertain state BEFORE clicking send (prevents automatic double-submit)
-    attempt_entry["state"] = "submit_uncertain"
-    attempt_entry["send_initiated"] = True
-    attempt_entry["send_initiated_at"] = utc_now_iso()
-    attempt_entry["prompt_sha256"] = sha256_text(prompt_text)
-    pre_send_url = str(inspected.get("url") or inspected.get("page_url") or inspect_env.get("page_url") or project_url)
-    attempt_entry["conversation_url"] = validate_official_url(pre_send_url)
-    journal.save(task_id, job)
-
-    # Step 4: Click non-disabled send button
-    try:
-        click_env = browser.eval_js(tab_id, JS_CLICK_SEND)
-    except BrowserTimeoutError as exc:
-        journal.record_error(attempt_entry, "click_send_timeout", exc.message)
-        journal.save(task_id, job)
-        return 3, {
-            "command": "submit",
-            "status": "uncertain",
-            "sent": None,
-            "task_id": task_id,
-            "attempt": attempt,
-            "job_branch": job_branch,
-            "contract_sha256": contract_sha256,
-            "task_marker": task_marker,
-            "error": exc.message,
-        }
-    except BrowserError as exc:
-        journal.record_error(attempt_entry, "click_send_error", exc.message)
-        journal.save(task_id, job)
-        return 3, {
-            "command": "submit",
-            "status": "uncertain",
-            "sent": None,
-            "task_id": task_id,
-            "attempt": attempt,
-            "job_branch": job_branch,
-            "contract_sha256": contract_sha256,
-            "task_marker": task_marker,
-            "error": exc.message,
-        }
-
-    click_parsed = click_env.get("parsed")
-    if not isinstance(click_parsed, dict) or not click_parsed.get("clicked"):
-        reason = click_parsed.get("reason") if isinstance(click_parsed, dict) else "unknown_click_result"
-        attempt_entry["state"] = "blocked_before_send"
-        attempt_entry["send_initiated"] = False
-        journal.record_error(attempt_entry, "click_send_refused", str(reason))
-        journal.save(task_id, job)
-        raise BrowserError("send_not_clicked", f"Send button was not clicked ({reason}).")
-
-    # Step 5: Bounded post-send read-only confirmation
-    post_url = str(
-        click_parsed.get("url")
-        or click_parsed.get("page_url")
-        or click_env.get("page_url")
-        or attempt_entry["conversation_url"]
-    )
-    try:
-        post_env = browser.eval_js(tab_id, build_status_inspect_js(task_marker))
-        post_status = classify_ui_status(post_env, task_marker=task_marker, fallback_url=post_url)
-        if post_status.get("url"):
-            try:
-                attempt_entry["conversation_url"] = validate_official_url(post_status["url"])
-            except ValidationError:
-                pass
-        if post_status.get("marker_in_conversation") or post_status.get("classification") == "running":
-            attempt_entry["state"] = "submitted"
-            attempt_entry["submitted_at"] = utc_now_iso()
-            journal.save(task_id, job)
-            return 0, {
+            return 3, {
                 "command": "submit",
-                "status": "submitted",
-                "sent": True,
+                "status": "uncertain_no_double_submit",
+                "sent": False,
+                "reconciled": False,
                 "task_id": task_id,
                 "attempt": attempt,
                 "job_branch": job_branch,
-                "task_snapshot_path": task_snapshot_path,
+                "contract_sha256": contract_sha256,
+                "task_marker": task_marker,
+                "error": "Previous send attempt is uncertain; refusing to double-send. Inspect conversation or create attempt+1.",
+            }
+
+        # Step 1: GitHub branch & immutable task snapshot sync/reconciliation
+        discovered_remote_snapshot_without_local = False
+        branch_head = mcp.get_branch_head_sha(job_branch)
+        if attempt == 1:
+            if branch_head is None:
+                base_head = mcp.get_branch_head_sha(validated["base_branch"])
+                if base_head is not None and mcp.get_file_text(task_snapshot_path, base_head) is not None:
+                    raise ValidationError(
+                        "snapshot_already_on_base_branch",
+                        f"Snapshot path '{task_snapshot_path}' already exists on base_branch '{validated['base_branch']}'.",
+                    )
+                mcp.create_branch(job_branch, validated["base_branch"])
+                attempt_entry["branch_created"] = True
+                journal.save(task_id, job)
+            else:
+                existing_snapshot = mcp.get_file_text(task_snapshot_path, branch_head)
+                if existing_snapshot is not None:
+                    validate_snapshot_matches_contract(
+                        existing_snapshot,
+                        contract_sha256,
+                        expected_task_id=task_id,
+                        expected_attempt=attempt,
+                    )
+                    if not had_local_attempt_before:
+                        discovered_remote_snapshot_without_local = True
+                    attempt_entry["branch_created"] = True
+                    attempt_entry["task_snapshot_written"] = True
+                    journal.save(task_id, job)
+                elif not attempt_entry.get("branch_created"):
+                    raise ValidationError(
+                        "job_branch_already_exists",
+                        f"Job branch '{job_branch}' already exists on GitHub without matching attempt-01 snapshot.",
+                    )
+        else:
+            if branch_head is None:
+                raise ValidationError(
+                    "missing_job_branch",
+                    f"Attempt {attempt} requires existing GitHub job branch '{job_branch}'.",
+                )
+            _verify_prior_task_snapshots(mcp, job, task_id, attempt, branch_head)
+            existing_snapshot = mcp.get_file_text(task_snapshot_path, branch_head)
+            if existing_snapshot is not None:
+                validate_snapshot_matches_contract(
+                    existing_snapshot,
+                    contract_sha256,
+                    expected_task_id=task_id,
+                    expected_attempt=attempt,
+                )
+                if not had_local_attempt_before:
+                    discovered_remote_snapshot_without_local = True
+                attempt_entry["task_snapshot_written"] = True
+                journal.save(task_id, job)
+
+        if not attempt_entry.get("task_snapshot_written"):
+            snapshot_content = build_snapshot_document(validated)
+            mcp.create_file_immutable(
+                branch=job_branch,
+                path=task_snapshot_path,
+                content=snapshot_content,
+                message=f"chore(bridge): persist immutable task snapshot {task_id} attempt-{attempt:02d}",
+            )
+            attempt_entry["task_snapshot_written"] = True
+            attempt_entry["state"] = "github_synced"
+            journal.save(task_id, job)
+
+        # Check if result already exists on GitHub before touching browser
+        current_head = mcp.get_branch_head_sha(job_branch)
+        if current_head and mcp.get_file_text(result_snapshot_path, current_head) is not None:
+            attempt_entry["state"] = "submitted"
+            journal.save(task_id, job)
+            return 0, {
+                "command": "submit",
+                "status": "reconciled_already_submitted",
+                "sent": False,
+                "reconciled": True,
+                "reconciled_via": "github_result_snapshot",
+                "task_id": task_id,
+                "attempt": attempt,
+                "job_branch": job_branch,
+                "contract_sha256": contract_sha256,
+                "task_marker": task_marker,
+            }
+
+        # Fresh/restarted --state-dir discovered an already-existing remote snapshot: reconcile instead of double-sending!
+        if discovered_remote_snapshot_without_local:
+            found_status = _find_marker_across_official_tabs(
+                browser,
+                task_marker,
+                tab_id_override=args.tab_id,
+                preferred_url=project_url,
+            )
+            if found_status is not None and found_status.get("marker_in_conversation"):
+                if found_status.get("url"):
+                    try:
+                        attempt_entry["conversation_url"] = validate_official_url(found_status["url"])
+                    except ValidationError:
+                        pass
+                attempt_entry["state"] = "submitted"
+                attempt_entry["updated_at"] = utc_now_iso()
+                journal.save(task_id, job)
+                return 0, {
+                    "command": "submit",
+                    "status": "reconciled_already_submitted",
+                    "sent": False,
+                    "reconciled": True,
+                    "reconciled_via": "official_conversation_marker",
+                    "task_id": task_id,
+                    "attempt": attempt,
+                    "job_branch": job_branch,
+                    "contract_sha256": contract_sha256,
+                    "task_marker": task_marker,
+                    "conversation_url": attempt_entry.get("conversation_url"),
+                }
+            attempt_entry["state"] = "submit_uncertain"
+            attempt_entry["send_initiated"] = True
+            journal.record_error(
+                attempt_entry,
+                "remote_snapshot_reconcile",
+                "Remote task snapshot already exists without prior local journal; refusing blind send to prevent duplicate dispatch.",
+            )
+            journal.save(task_id, job)
+            return 3, {
+                "command": "submit",
+                "status": "uncertain_no_double_submit",
+                "sent": False,
+                "reconciled": False,
+                "task_id": task_id,
+                "attempt": attempt,
+                "job_branch": job_branch,
+                "contract_sha256": contract_sha256,
+                "task_marker": task_marker,
+                "error": "Remote task snapshot already exists without local journal record; refusing automatic double submit.",
+            }
+
+        # Step 2: Official browser UI navigation -> focus+selectAll -> paste -> separate inspect
+        tab_id = browser.resolve_official_tab(
+            tab_id_override=args.tab_id,
+            target_url=project_url,
+            navigate_to_target=True,
+        )
+
+        try:
+            focus_env = browser.eval_js(tab_id, JS_FOCUS_SELECT_ALL)
+            focus_parsed = focus_env.get("parsed")
+            if not isinstance(focus_parsed, dict) or not focus_parsed.get("ok"):
+                raise BrowserError("focus_select_failed", "Failed to focus prompt editor and run execCommand(selectAll).")
+
+            paste_env = browser.eval_js(tab_id, build_paste_js(prompt_text))
+            paste_parsed = paste_env.get("parsed")
+            if not isinstance(paste_parsed, dict) or not paste_parsed.get("dispatched"):
+                raise BrowserError("paste_dispatch_failed", "Failed to dispatch ClipboardEvent paste.")
+
+            inspect_env = browser.eval_js(tab_id, build_inspect_draft_js(task_marker))
+            inspected = _verify_pre_send_ui(
+                inspect_env,
+                expected_prompt=prompt_text,
+                expected_project=args.expected_project,
+                expected_model=args.expected_model,
+            )
+        except BridgeError as exc:
+            attempt_entry["state"] = "blocked_before_send"
+            journal.record_error(attempt_entry, "pre_send", exc.message)
+            journal.save(task_id, job)
+            raise
+
+        # If task_marker is already present in this conversation, reconcile instead of clicking Send again!
+        if inspected.get("marker_in_conversation") is True:
+            pre_url = str(inspected.get("url") or inspected.get("page_url") or inspect_env.get("page_url") or project_url)
+            attempt_entry["conversation_url"] = validate_official_url(pre_url)
+            attempt_entry["state"] = "submitted"
+            attempt_entry["updated_at"] = utc_now_iso()
+            journal.save(task_id, job)
+            return 0, {
+                "command": "submit",
+                "status": "reconciled_already_submitted",
+                "sent": False,
+                "reconciled": True,
+                "reconciled_via": "pre_send_conversation_marker",
+                "task_id": task_id,
+                "attempt": attempt,
+                "job_branch": job_branch,
                 "contract_sha256": contract_sha256,
                 "task_marker": task_marker,
                 "conversation_url": attempt_entry["conversation_url"],
             }
-    except BrowserError as exc:
-        journal.record_error(attempt_entry, "post_send_confirm", exc.message)
 
-    journal.save(task_id, job)
-    return 3, {
-        "command": "submit",
-        "status": "uncertain",
-        "sent": True,
-        "task_id": task_id,
-        "attempt": attempt,
-        "job_branch": job_branch,
-        "contract_sha256": contract_sha256,
-        "task_marker": task_marker,
-        "conversation_url": attempt_entry.get("conversation_url"),
-        "error": "Send click executed, but post-send confirmation did not yet verify task marker; reconcile via status/submit without double-sending.",
-    }
+        # Step 3: Journal uncertain state BEFORE clicking send (prevents automatic double-submit)
+        attempt_entry["state"] = "submit_uncertain"
+        attempt_entry["send_initiated"] = True
+        attempt_entry["send_initiated_at"] = utc_now_iso()
+        attempt_entry["prompt_sha256"] = sha256_text(prompt_text)
+        pre_send_url = str(inspected.get("url") or inspected.get("page_url") or inspect_env.get("page_url") or project_url)
+        attempt_entry["conversation_url"] = validate_official_url(pre_send_url)
+        journal.save(task_id, job)
+
+        # Step 4: Click non-disabled send button
+        try:
+            click_env = browser.eval_js(tab_id, JS_CLICK_SEND)
+        except BrowserTimeoutError as exc:
+            journal.record_error(attempt_entry, "click_send_timeout", exc.message)
+            journal.save(task_id, job)
+            return 3, {
+                "command": "submit",
+                "status": "uncertain",
+                "sent": None,
+                "task_id": task_id,
+                "attempt": attempt,
+                "job_branch": job_branch,
+                "contract_sha256": contract_sha256,
+                "task_marker": task_marker,
+                "error": exc.message,
+            }
+        except BrowserError as exc:
+            journal.record_error(attempt_entry, "click_send_error", exc.message)
+            journal.save(task_id, job)
+            return 3, {
+                "command": "submit",
+                "status": "uncertain",
+                "sent": None,
+                "task_id": task_id,
+                "attempt": attempt,
+                "job_branch": job_branch,
+                "contract_sha256": contract_sha256,
+                "task_marker": task_marker,
+                "error": exc.message,
+            }
+
+        click_parsed = click_env.get("parsed")
+        # ONLY verified pre-click refusal may clear send_initiated; unknown/null/malformed results stay uncertain (exit 3)!
+        if (
+            isinstance(click_parsed, dict)
+            and click_parsed.get("clicked") is False
+            and click_parsed.get("reason") in ("send_button_not_found", "send_button_disabled")
+        ):
+            reason = str(click_parsed["reason"])
+            attempt_entry["state"] = "blocked_before_send"
+            attempt_entry["send_initiated"] = False
+            journal.record_error(attempt_entry, "click_send_refused", reason)
+            journal.save(task_id, job)
+            raise BrowserError("send_not_clicked", f"Send button was not clicked ({reason}).")
+
+        if not (isinstance(click_parsed, dict) and click_parsed.get("clicked") is True):
+            reason = (
+                "null_js_return"
+                if click_env.get("parsed_is_null") is True
+                else (str(click_parsed.get("reason")) if isinstance(click_parsed, dict) and click_parsed.get("reason") else "unknown_click_result")
+            )
+            journal.record_error(attempt_entry, "click_send_uncertain", f"Unverified post-click response ({reason}).")
+            journal.save(task_id, job)
+            return 3, {
+                "command": "submit",
+                "status": "uncertain",
+                "sent": None,
+                "task_id": task_id,
+                "attempt": attempt,
+                "job_branch": job_branch,
+                "contract_sha256": contract_sha256,
+                "task_marker": task_marker,
+                "conversation_url": attempt_entry.get("conversation_url"),
+                "error": f"Post-click result is uncertain ({reason}); send_initiated preserved to prevent double-submit.",
+            }
+
+        # Step 5: Bounded post-send read-only confirmation (requires verified marker_in_conversation!)
+        post_url = str(
+            click_parsed.get("url")
+            or click_parsed.get("page_url")
+            or click_env.get("page_url")
+            or attempt_entry["conversation_url"]
+        )
+        try:
+            post_env = browser.eval_js(tab_id, build_status_inspect_js(task_marker))
+            post_status = classify_ui_status(post_env, task_marker=task_marker, fallback_url=post_url)
+            if post_status.get("marker_in_conversation") is True:
+                if post_status.get("url"):
+                    try:
+                        attempt_entry["conversation_url"] = validate_official_url(post_status["url"])
+                    except ValidationError:
+                        pass
+                attempt_entry["state"] = "submitted"
+                attempt_entry["submitted_at"] = utc_now_iso()
+                journal.save(task_id, job)
+                return 0, {
+                    "command": "submit",
+                    "status": "submitted",
+                    "sent": True,
+                    "task_id": task_id,
+                    "attempt": attempt,
+                    "job_branch": job_branch,
+                    "task_snapshot_path": task_snapshot_path,
+                    "contract_sha256": contract_sha256,
+                    "task_marker": task_marker,
+                    "conversation_url": attempt_entry["conversation_url"],
+                }
+        except BrowserError as exc:
+            journal.record_error(attempt_entry, "post_send_confirm", exc.message)
+
+        journal.save(task_id, job)
+        return 3, {
+            "command": "submit",
+            "status": "uncertain",
+            "sent": True,
+            "task_id": task_id,
+            "attempt": attempt,
+            "job_branch": job_branch,
+            "contract_sha256": contract_sha256,
+            "task_marker": task_marker,
+            "conversation_url": attempt_entry.get("conversation_url"),
+            "error": "Send click executed, but post-send confirmation did not verify task marker in conversation; reconcile via status/submit without double-sending.",
+        }
 
 
 def cmd_status(
@@ -2200,104 +3014,183 @@ def cmd_status(
     browser_client: Optional[BrowserUseClient] = None,
 ) -> Tuple[int, Dict[str, Any]]:
     timeout = validate_timeout(args.timeout)
+    if args.tab_id is not None:
+        validate_tab_id(args.tab_id)
     journal = JobJournal(args.state_dir)
 
+    validated: Optional[Dict[str, Any]] = None
     if args.contract:
         validated = load_and_validate_contract(args.contract)
         task_id = validated["task_id"]
-        attempt = args.attempt if args.attempt is not None else validated["attempt"]
-        task_marker = validated["task_marker"]
+        if args.attempt is not None:
+            requested_attempt = validate_attempt(args.attempt)
+            if requested_attempt != validated["attempt"]:
+                raise ValidationError(
+                    "attempt_mismatch",
+                    f"--attempt {requested_attempt} does not match contract attempt {validated['attempt']}.",
+                )
+        attempt: Optional[int] = validated["attempt"]
     elif args.task_id:
         task_id = validate_task_id(args.task_id)
         attempt = validate_attempt(args.attempt) if args.attempt is not None else None
-        task_marker = None
     else:
         raise ValidationError("missing_task_selector", "Provide either --contract or --task-id.")
 
-    job = journal.load(task_id)
-    if job is None:
-        raise ValidationError("journal_not_found", f"No local job journal found for task '{task_id}'.")
+    with journal.lock_task(task_id):
+        job = journal.load(task_id)
+        if job is None:
+            raise ValidationError("journal_not_found", f"No local job journal found for task '{task_id}'.")
 
-    if attempt is None:
-        numeric = sorted(int(k) for k in job.get("attempts", {}).keys() if k.isdigit())
-        if not numeric:
-            raise ValidationError("no_attempts_recorded", f"No attempts recorded in journal for '{task_id}'.")
-        attempt = numeric[-1]
-    else:
-        attempt = validate_attempt(attempt)
+        if attempt is None:
+            numeric = sorted(int(k) for k in job.get("attempts", {}).keys() if k.isdigit())
+            if not numeric:
+                raise ValidationError("no_attempts_recorded", f"No attempts recorded in journal for '{task_id}'.")
+            attempt = numeric[-1]
+        else:
+            attempt = validate_attempt(attempt)
 
-    attempt_entry = journal.get_attempt(job, attempt)
-    if attempt_entry is None:
-        raise ValidationError("attempt_not_found", f"Attempt {attempt} not found in journal for '{task_id}'.")
+        attempt_entry = journal.get_attempt(job, attempt)
+        if attempt_entry is None:
+            raise ValidationError("attempt_not_found", f"Attempt {attempt} not found in journal for '{task_id}'.")
 
-    task_marker = task_marker or attempt_entry.get("task_marker")
-    target_url = args.conversation_url or attempt_entry.get("conversation_url") or DEFAULT_PROJECT_URL
-    target_url = validate_official_url(target_url, "conversation URL")
+        journal_marker = attempt_entry.get("task_marker")
+        if validated is not None and journal_marker and journal_marker != validated["task_marker"]:
+            raise ValidationError(
+                "task_marker_mismatch",
+                "Contract task_marker does not match recorded journal attempt task_marker.",
+            )
+        task_marker = journal_marker or (validated["task_marker"] if validated else None)
 
-    browser = browser_client or BrowserUseClient(args.browser_bin, timeout)
-    tab_id = browser.resolve_official_tab(
-        tab_id_override=args.tab_id,
-        target_url=target_url,
-        navigate_to_target=False,
-    )
-    ui_env = browser.eval_js(tab_id, build_status_inspect_js(task_marker or ""))
-    classified = classify_ui_status(ui_env, task_marker=task_marker, fallback_url=target_url)
+        saved_conv_url = attempt_entry.get("conversation_url")
+        target_url = args.conversation_url or saved_conv_url or DEFAULT_PROJECT_URL
+        target_url = validate_official_url(target_url, "conversation URL")
 
-    obs = {
-        "timestamp": utc_now_iso(),
-        "classification": classified["classification"],
-        "reason": classified["reason"],
-        "url": classified["url"],
-        "running": classified["running"],
-        "marker_in_conversation": classified["marker_in_conversation"],
-        "evidence": classified["evidence"],
-    }
-    history = attempt_entry.setdefault("status_history", [])
-    history.append(obs)
-    if len(history) > 50:
-        del history[:-50]
+        browser = browser_client or BrowserUseClient(args.browser_bin, timeout)
+        classified: Optional[Dict[str, Any]] = None
 
-    if classified["url"]:
-        try:
-            attempt_entry["conversation_url"] = validate_official_url(classified["url"])
-        except ValidationError:
-            pass
-    if classified["classification"] == "blocked":
-        journal.record_error(attempt_entry, "status_blocked", f"{classified['reason']}: {classified['evidence']}")
-    elif attempt_entry["state"] == "submit_uncertain" and classified["marker_in_conversation"]:
-        attempt_entry["state"] = "submitted"
-    attempt_entry["updated_at"] = utc_now_iso()
-    journal.save(task_id, job)
+        if args.tab_id is not None:
+            safe_tid = validate_tab_id(args.tab_id)
+            ui_env = browser.eval_js(safe_tid, build_status_inspect_js(task_marker or ""))
+            classified = classify_ui_status(ui_env, task_marker=task_marker, fallback_url=target_url)
+        else:
+            tabs = browser.list_tabs()
+            official_tabs: List[Dict[str, str]] = []
+            for tab in tabs:
+                try:
+                    validate_official_url(tab["url"], "tab URL")
+                    official_tabs.append(tab)
+                except ValidationError:
+                    continue
 
-    exit_code = 2 if classified["classification"] == "blocked" else 0
-    return exit_code, {
-        "command": "status",
-        "task_id": task_id,
-        "attempt": attempt,
-        "job_branch": job["job_branch"],
-        "classification": classified["classification"],
-        "reason": classified["reason"],
-        "accepted": False,
-        "running": classified["running"],
-        "marker_in_conversation": classified["marker_in_conversation"],
-        "conversation_url": classified["url"],
-        "evidence": classified["evidence"],
-    }
+            exact_tab: Optional[Dict[str, str]] = None
+            if _is_specific_conversation_url(target_url):
+                target_path = urlparse(target_url).path.rstrip("/")
+                exact_tab = next(
+                    (t for t in official_tabs if t["url"] == target_url or urlparse(t["url"]).path.rstrip("/") == target_path),
+                    None,
+                )
+
+            if exact_tab is not None:
+                ui_env = browser.eval_js(exact_tab["tab_id"], build_status_inspect_js(task_marker or ""))
+                classified = classify_ui_status(ui_env, task_marker=task_marker, fallback_url=exact_tab["url"])
+            elif task_marker:
+                # Bounded read-only scan for the tab actually holding this attempt's task_marker (never fall back to unrelated chat!)
+                for tab in official_tabs[:20]:
+                    try:
+                        ui_env = browser.eval_js(tab["tab_id"], build_status_inspect_js(task_marker))
+                    except BrowserError:
+                        continue
+                    candidate = classify_ui_status(ui_env, task_marker=task_marker, fallback_url=tab["url"])
+                    if candidate.get("marker_in_conversation"):
+                        classified = candidate
+                        break
+
+            if classified is None:
+                classified = {
+                    "classification": "blocked",
+                    "reason": "conversation_tab_not_found" if _is_specific_conversation_url(target_url) else "marker_not_found_in_official_tabs",
+                    "url": sanitize_text(saved_conv_url or target_url, max_len=300),
+                    "running": False,
+                    "marker_in_conversation": False,
+                    "accepted": False,
+                    "evidence": "Could not locate an open official tab matching this attempt's conversation URL or task_marker.",
+                }
+
+        obs = {
+            "timestamp": utc_now_iso(),
+            "classification": classified["classification"],
+            "reason": classified["reason"],
+            "url": classified["url"],
+            "running": classified["running"],
+            "marker_in_conversation": classified["marker_in_conversation"],
+            "evidence": classified["evidence"],
+        }
+        history = attempt_entry.setdefault("status_history", [])
+        history.append(obs)
+        if len(history) > 50:
+            del history[:-50]
+
+        # Only update saved conversation_url when this attempt's exact task_marker is verified in conversation!
+        if classified.get("marker_in_conversation") is True and classified.get("url"):
+            try:
+                attempt_entry["conversation_url"] = validate_official_url(classified["url"])
+            except ValidationError:
+                pass
+        if classified["classification"] == "blocked":
+            journal.record_error(attempt_entry, "status_blocked", f"{classified['reason']}: {classified['evidence']}")
+        elif attempt_entry["state"] == "submit_uncertain" and classified["marker_in_conversation"]:
+            attempt_entry["state"] = "submitted"
+        attempt_entry["updated_at"] = utc_now_iso()
+        journal.save(task_id, job)
+
+        exit_code = 2 if classified["classification"] == "blocked" else 0
+        return exit_code, {
+            "command": "status",
+            "task_id": task_id,
+            "attempt": attempt,
+            "job_branch": job["job_branch"],
+            "classification": classified["classification"],
+            "reason": classified["reason"],
+            "accepted": False,
+            "running": classified["running"],
+            "marker_in_conversation": classified["marker_in_conversation"],
+            "conversation_url": classified["url"],
+            "evidence": classified["evidence"],
+        }
 
 
 def _safe_write_collected_file(root: Path, rel_path: str, content: str) -> Path:
+    """Safely write a collected file under root, rejecting symlinks and path escapes."""
     cleaned = validate_relative_path(rel_path, allow_jobs_prefix=True)
+    if root.is_symlink():
+        raise ValidationError("symlink_rejected", f"Refusing to write inside symlink collection root: {root.name}")
+    parts = cleaned.split("/")
+    target = _ensure_subtree_no_symlink(root, parts, create_dirs=True)
     root_resolved = root.resolve()
-    target = (root_resolved / cleaned).resolve()
+    parent_resolved = target.parent.resolve()
     try:
-        target.relative_to(root_resolved)
+        parent_resolved.relative_to(root_resolved)
     except ValueError as exc:
         raise ValidationError("local_path_escape", f"Refusing to write outside collection directory: {rel_path}") from exc
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(f"{target.name}.tmp.{os.getpid()}")
-    tmp.write_text(content, encoding="utf-8")
-    os.replace(tmp, target)
+    if target.is_symlink():
+        raise ValidationError("symlink_rejected", f"Refusing to overwrite symlink file: {rel_path}")
+    _atomic_write_text_no_follow(target, content, mode=0o600)
     return target
+
+
+def _assert_dir_tree_has_no_symlinks(root: Path) -> None:
+    if root.is_symlink():
+        raise ValidationError("symlink_rejected", f"Refusing to operate on symlink directory: {root.name}")
+    if not root.exists():
+        return
+    for dirpath, dirnames, filenames in os.walk(str(root), followlinks=False):
+        dp = Path(dirpath)
+        if dp.is_symlink():
+            raise ValidationError("symlink_rejected", f"Refusing to traverse symlink directory: {dp.name}")
+        for name in dirnames + filenames:
+            p = dp / name
+            if p.is_symlink():
+                raise ValidationError("symlink_rejected", f"Refusing to operate on symlink inside collection: {name}")
 
 
 def cmd_collect(
@@ -2329,7 +3222,8 @@ def cmd_collect(
             "contract_sha256": contract_sha256,
             "planned_reads": [
                 f"resolve authoritative head SHA of {job_branch}",
-                f"fetch {task_snapshot_path} at head SHA",
+                f"verify {task_snapshot_path} and prior attempt snapshots at head SHA",
+                f"audit branch write scope via bounded list_commits + get_commit against {validated['base_branch']}",
                 f"fetch {result_snapshot_path} at head SHA",
                 "fetch each allowlisted artifact declared in result.json at head SHA",
             ],
@@ -2337,134 +3231,175 @@ def cmd_collect(
         }
 
     mcp = mcp_client or GitHubMcpClient(args.mcp_bin, args.mcp_server, timeout)
-    job = journal.ensure_job(validated)
-    attempt_entry = journal.ensure_attempt(job, validated)
 
-    head_sha: Optional[str] = None
-    result_sha256: Optional[str] = None
-    try:
-        head_sha = mcp.get_branch_head_sha(job_branch)
-        if not head_sha:
-            raise ValidationError("missing_job_branch", f"Job branch '{job_branch}' not found on GitHub.")
+    with journal.lock_task(task_id):
+        job = journal.ensure_job(validated)
+        attempt_entry = journal.ensure_attempt(job, validated)
 
-        # Verify immutable task snapshot at authoritative head SHA
-        remote_task_text = mcp.get_file_text(task_snapshot_path, head_sha)
-        if remote_task_text is None:
-            raise ValidationError("missing_remote_task_snapshot", f"Missing '{task_snapshot_path}' at {head_sha}.")
-        validate_snapshot_matches_contract(remote_task_text, contract_sha256)
+        head_sha: Optional[str] = None
+        result_sha256: Optional[str] = None
+        try:
+            # Fail closed before any remote/local writes if state_dir/collected hierarchy contains symlinks
+            journal._validate_state_dirs(create_jobs=True, create_collected=False)
+            if journal.collected_dir.is_symlink():
+                raise ValidationError("symlink_rejected", "Refusing to use symlink collected directory.")
+            task_collect_dir = journal.collected_dir / task_id
+            if task_collect_dir.is_symlink():
+                raise ValidationError("symlink_rejected", "Refusing to use symlink task collection directory.")
+            if collect_root.is_symlink():
+                raise ValidationError("symlink_rejected", "Refusing to use symlink attempt collection directory.")
 
-        # Fetch and validate result.json at authoritative head SHA
-        raw_result_text = mcp.get_file_text(result_snapshot_path, head_sha)
-        if raw_result_text is None:
-            raise ValidationError("missing_result_manifest", f"Missing '{result_snapshot_path}' at {head_sha}.")
-        result_sha256 = sha256_text(raw_result_text)
-        manifest = validate_result_manifest(raw_result_text, validated)
+            head_sha = mcp.get_branch_head_sha(job_branch)
+            if not head_sha:
+                raise ValidationError("missing_job_branch", f"Job branch '{job_branch}' not found on GitHub.")
 
-        if manifest["status"] == "blocked":
+            # Verify immutable task snapshot at authoritative head SHA
+            remote_task_text = mcp.get_file_text(task_snapshot_path, head_sha)
+            if remote_task_text is None:
+                raise ValidationError("missing_remote_task_snapshot", f"Missing '{task_snapshot_path}' at {head_sha}.")
+            validate_snapshot_matches_contract(
+                remote_task_text,
+                contract_sha256,
+                expected_task_id=task_id,
+                expected_attempt=attempt,
+            )
+
+            # Verify all prior attempt immutable task snapshots on attempt > 1
+            prior_snapshots = _verify_prior_task_snapshots(mcp, job, task_id, attempt, head_sha)
+
+            # Audit branch write scope via bounded list_commits + get_commit (or report scope_unverified honestly)
+            scope_info = _check_branch_write_scope(mcp, validated, head_sha, prior_snapshots)
+
+            # Fetch and validate result.json at authoritative head SHA
+            raw_result_text = mcp.get_file_text(result_snapshot_path, head_sha)
+            if raw_result_text is None:
+                raise ValidationError("missing_result_manifest", f"Missing '{result_snapshot_path}' at {head_sha}.")
+            result_sha256 = sha256_text(raw_result_text)
+            manifest = validate_result_manifest(raw_result_text, validated)
+
+            if manifest["status"] == "blocked":
+                record = {
+                    "timestamp": utc_now_iso(),
+                    "status": "blocked",
+                    "head_sha": head_sha,
+                    "result_sha256": result_sha256,
+                    "branch_scope_status": scope_info["status"],
+                    "summary": manifest["summary"],
+                    "artifacts": [],
+                }
+                attempt_entry.setdefault("collection_history", []).append(record)
+                journal.record_error(attempt_entry, "collect_blocked", manifest["summary"])
+                journal.save(task_id, job)
+                return 2, {
+                    "command": "collect",
+                    "status": "blocked",
+                    "accepted": False,
+                    "task_id": task_id,
+                    "attempt": attempt,
+                    "job_branch": job_branch,
+                    "head_sha": head_sha,
+                    "contract_sha256": contract_sha256,
+                    "result_sha256": result_sha256,
+                    "branch_scope_status": scope_info["status"],
+                    "branch_scope_reason": scope_info["reason"],
+                    "summary": manifest["summary"],
+                    "tests": manifest["tests"],
+                }
+
+            # Fetch every allowlisted artifact at authoritative head_sha (read-only; never execute!)
+            fetched_contents: List[Tuple[str, str]] = []
+            for art_path in manifest["artifacts"]:
+                art_text = mcp.get_file_text(art_path, head_sha)
+                if art_text is None:
+                    raise ValidationError(
+                        "missing_artifact",
+                        f"Declared artifact '{art_path}' not found at commit {head_sha}.",
+                    )
+                if not art_text.strip():
+                    raise ValidationError(
+                        "empty_artifact_content",
+                        f"Declared artifact '{art_path}' at commit {head_sha} is empty.",
+                    )
+                fetched_contents.append((art_path, art_text))
+
+            # Prepare clean symlink-free collection directory (removing stale files from prior collects of this attempt)
+            _ensure_subtree_no_symlink(journal.state_dir, ["collected", task_id], create_dirs=True, leaf_is_dir=True)
+            if collect_root.exists():
+                _assert_dir_tree_has_no_symlinks(collect_root)
+                try:
+                    shutil.rmtree(str(collect_root))
+                except OSError as exc:
+                    raise BridgeError("filesystem_write_error", f"Failed to clean stale collection dir: {exc}") from exc
+            _ensure_no_symlink_dir(collect_root, create=True)
+
+            # Write result.json + fetched artifacts to isolated local collection directory
+            local_result_path = _safe_write_collected_file(collect_root, result_snapshot_path, raw_result_text)
+            artifact_records: List[Dict[str, Any]] = []
+            for art_path, art_text in fetched_contents:
+                local_path = _safe_write_collected_file(collect_root, art_path, art_text)
+                raw_bytes = art_text.encode("utf-8")
+                artifact_records.append(
+                    {
+                        "path": art_path,
+                        "local_path": str(local_path),
+                        "sha256": sha256_bytes(raw_bytes),
+                        "size_bytes": len(raw_bytes),
+                    }
+                )
+
             record = {
                 "timestamp": utc_now_iso(),
-                "status": "blocked",
+                "status": "collected_not_accepted",
                 "head_sha": head_sha,
                 "result_sha256": result_sha256,
-                "summary": manifest["summary"],
-                "artifacts": [],
+                "branch_scope_status": scope_info["status"],
+                "local_result_path": str(local_result_path),
+                "artifacts": artifact_records,
             }
             attempt_entry.setdefault("collection_history", []).append(record)
-            journal.record_error(attempt_entry, "collect_blocked", manifest["summary"])
+            attempt_entry["state"] = "collected_not_accepted"
+            attempt_entry["updated_at"] = utc_now_iso()
             journal.save(task_id, job)
-            return 2, {
+
+            return 0, {
                 "command": "collect",
-                "status": "blocked",
+                "status": "collected_not_accepted",
                 "accepted": False,
+                "review_required": True,
+                "repository": validated["repository"],
                 "task_id": task_id,
                 "attempt": attempt,
                 "job_branch": job_branch,
                 "head_sha": head_sha,
                 "contract_sha256": contract_sha256,
                 "result_sha256": result_sha256,
+                "branch_scope_status": scope_info["status"],
+                "branch_scope_reason": scope_info["reason"],
+                "local_result_path": str(local_result_path),
+                "artifacts": artifact_records,
                 "summary": manifest["summary"],
                 "tests": manifest["tests"],
+                "evidence": {
+                    "task_snapshot_verified": True,
+                    "prior_snapshots_verified": len(prior_snapshots),
+                    "branch_write_scope_verified": scope_info["verified"],
+                    "branch_commits_checked": scope_info["checked_commits"],
+                    "executed_downloaded_code": False,
+                },
             }
-
-        # Fetch every allowlisted artifact at authoritative head_sha (read-only; never execute!)
-        fetched_contents: List[Tuple[str, str]] = []
-        for art_path in manifest["artifacts"]:
-            art_text = mcp.get_file_text(art_path, head_sha)
-            if art_text is None:
-                raise ValidationError(
-                    "missing_artifact",
-                    f"Declared artifact '{art_path}' not found at commit {head_sha}.",
-                )
-            if not art_text.strip():
-                raise ValidationError(
-                    "empty_artifact_content",
-                    f"Declared artifact '{art_path}' at commit {head_sha} is empty.",
-                )
-            fetched_contents.append((art_path, art_text))
-
-        # Write result.json + fetched artifacts to isolated local collection directory
-        local_result_path = _safe_write_collected_file(collect_root, result_snapshot_path, raw_result_text)
-        artifact_records: List[Dict[str, Any]] = []
-        for art_path, art_text in fetched_contents:
-            local_path = _safe_write_collected_file(collect_root, art_path, art_text)
-            raw_bytes = art_text.encode("utf-8")
-            artifact_records.append(
-                {
-                    "path": art_path,
-                    "local_path": str(local_path),
-                    "sha256": sha256_bytes(raw_bytes),
-                    "size_bytes": len(raw_bytes),
-                }
-            )
-
-        record = {
-            "timestamp": utc_now_iso(),
-            "status": "collected_not_accepted",
-            "head_sha": head_sha,
-            "result_sha256": result_sha256,
-            "local_result_path": str(local_result_path),
-            "artifacts": artifact_records,
-        }
-        attempt_entry.setdefault("collection_history", []).append(record)
-        attempt_entry["state"] = "collected_not_accepted"
-        attempt_entry["updated_at"] = utc_now_iso()
-        journal.save(task_id, job)
-
-        return 0, {
-            "command": "collect",
-            "status": "collected_not_accepted",
-            "accepted": False,
-            "review_required": True,
-            "repository": validated["repository"],
-            "task_id": task_id,
-            "attempt": attempt,
-            "job_branch": job_branch,
-            "head_sha": head_sha,
-            "contract_sha256": contract_sha256,
-            "result_sha256": result_sha256,
-            "local_result_path": str(local_result_path),
-            "artifacts": artifact_records,
-            "summary": manifest["summary"],
-            "tests": manifest["tests"],
-            "evidence": {
-                "task_snapshot_verified": True,
-                "self_referential_commit_sha_present": manifest["has_self_referential_commit_sha"],
-                "executed_downloaded_code": False,
-            },
-        }
-    except BridgeError as exc:
-        failure_record = {
-            "timestamp": utc_now_iso(),
-            "status": "collection_failed",
-            "head_sha": head_sha,
-            "result_sha256": result_sha256,
-            "error_code": exc.code,
-            "error": exc.message,
-        }
-        attempt_entry.setdefault("collection_history", []).append(failure_record)
-        journal.record_error(attempt_entry, "collect", f"{exc.code}: {exc.message}")
-        journal.save(task_id, job)
-        raise
+        except BridgeError as exc:
+            failure_record = {
+                "timestamp": utc_now_iso(),
+                "status": "collection_failed",
+                "head_sha": head_sha,
+                "result_sha256": result_sha256,
+                "error_code": exc.code,
+                "error": exc.message,
+            }
+            attempt_entry.setdefault("collection_history", []).append(failure_record)
+            journal.record_error(attempt_entry, "collect", f"{exc.code}: {exc.message}")
+            journal.save(task_id, job)
+            raise
 
 
 def build_parser() -> argparse.ArgumentParser:

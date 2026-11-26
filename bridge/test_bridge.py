@@ -83,9 +83,12 @@ def write_contract(tmp_dir: Path, data: dict, name: str = "contract.json") -> Pa
 class MockGitHubServer:
     """In-memory fake GitHub MCP runner simulating minis-mcp-cli responses."""
 
-    def __init__(self, *, envelope_mode: str = "resource") -> None:
+    def __init__(self, *, envelope_mode: str = "resource", enable_get_commit: bool = False) -> None:
         self.envelope_mode = envelope_mode
+        self.enable_get_commit = enable_get_commit
         self.branches: dict[str, str] = {"main": "1" * 40}
+        self.branch_commits: dict[str, list[str]] = {"main": ["1" * 40]}
+        self.commit_files: dict[str, list[str]] = {}
         self.files: dict[tuple[str, str], str] = {}  # (branch_or_sha, path) -> content
         self.calls: list[tuple[str, dict]] = []
         self.head_counter = 0
@@ -95,10 +98,22 @@ class MockGitHubServer:
         return f"{self.head_counter:040x}"
 
     def seed_file(self, branch: str, path: str, content: str, sha: str | None = None) -> str:
-        head = sha or self.branches.get(branch) or self._next_sha()
-        self.branches[branch] = head
+        if branch not in self.branches:
+            head = sha or self._next_sha()
+            self.branches[branch] = head
+            self.branch_commits[branch] = [head, self.branches["main"]]
+        else:
+            head = sha or self.branches[branch]
+            self.branches[branch] = head
+            if branch not in self.branch_commits:
+                self.branch_commits[branch] = [head, self.branches["main"]]
+            elif self.branch_commits[branch][0] != head:
+                self.branch_commits[branch].insert(0, head)
         self.files[(branch, path)] = content
         self.files[(head, path)] = content
+        self.commit_files.setdefault(head, [])
+        if path not in self.commit_files[head]:
+            self.commit_files[head].append(path)
         return head
 
     def _get_file(self, ref: str, path: str) -> str | None:
@@ -127,8 +142,21 @@ class MockGitHubServer:
                 return make_proc(
                     stdout=json.dumps({"isError": True, "content": [{"type": "text", "text": "404 Branch not found"}]})
                 )
-            payload = [{"sha": self.branches[branch]}]
+            per_page = int(args.get("perPage", 1))
+            history = self.branch_commits.get(branch, [self.branches[branch]])
+            payload = [{"sha": s} for s in history[:per_page]]
             return make_proc(stdout=json.dumps({"content": [{"type": "text", "text": json.dumps(payload)}]}))
+
+        if tool == "get_commit":
+            if not self.enable_get_commit:
+                return make_proc(
+                    stdout=json.dumps({"isError": True, "content": [{"type": "text", "text": "Tool 'get_commit' not found"}]})
+                )
+            csha = args["sha"]
+            files = [{"filename": p} for p in self.commit_files.get(csha, [])]
+            return make_proc(
+                stdout=json.dumps({"content": [{"type": "text", "text": json.dumps({"sha": csha, "files": files})}]})
+            )
 
         if tool == "create_branch":
             branch = args["branch"]
@@ -138,6 +166,7 @@ class MockGitHubServer:
                     stdout=json.dumps({"isError": True, "content": [{"type": "text", "text": "404 Base branch not found"}]})
                 )
             self.branches[branch] = self.branches[from_branch]
+            self.branch_commits[branch] = list(self.branch_commits.get(from_branch, [self.branches[from_branch]]))
             return make_proc(
                 stdout=json.dumps({"content": [{"type": "text", "text": json.dumps({"ref": f"refs/heads/{branch}"})}]})
             )
@@ -156,6 +185,8 @@ class MockGitHubServer:
                 )
             new_sha = self._next_sha()
             self.branches[branch] = new_sha
+            self.branch_commits.setdefault(branch, []).insert(0, new_sha)
+            self.commit_files[new_sha] = [path]
             self.files[(branch, path)] = content
             self.files[(new_sha, path)] = content
             return make_proc(
@@ -1463,6 +1494,703 @@ class TestRealMinisProtocolFixturesAndRegressions(unittest.TestCase):
         res_stale = bridge.classify_ui_status(env_stale, task_marker=marker)
         self.assertEqual(res_stale["classification"], "blocked")
         self.assertEqual(res_stale["reason"], "no_assistant_response_or_unconfirmed")
+
+
+class TestRevision02SecurityAndAuditRegressions(unittest.TestCase):
+    """Regressions for revision-02.md and reviews/bridge-v1-audit.md (A1, A2, A4, A5, A6, A7, A8, A9)."""
+
+    def test_a1_post_click_null_or_malformed_stays_uncertain_and_second_submit_never_clicks(self):
+        for case_name, click_response in [
+            (
+                "null_return_envelope",
+                make_proc(
+                    stdout=json.dumps(
+                        {
+                            "action": "execute_js",
+                            "ok": True,
+                            "data": {"success": True, "page_url": OFFICIAL_CONV_URL, "text": "null\n  tab_id: 4"},
+                        }
+                    )
+                ),
+            ),
+            ("missing_clicked_key", make_real_exec_js_proc({"url": OFFICIAL_CONV_URL})),
+            ("unknown_reason_false", make_real_exec_js_proc({"clicked": False, "reason": "unexpected_dom_error"})),
+        ]:
+            with self.subTest(case=case_name):
+                with tempfile.TemporaryDirectory() as td:
+                    td_path = Path(td)
+                    contract = sample_contract()
+                    cpath = write_contract(td_path, contract)
+                    validated = bridge.validate_contract_dict(contract)
+                    prompt = bridge.build_gemini_prompt(validated)
+                    state_dir = td_path / "state"
+                    gh = MockGitHubServer()
+                    clicks = {"count": 0}
+
+                    def runner(argv, timeout):
+                        cmd = argv[1]
+                        if cmd == "navigate":
+                            return make_proc(stdout=json.dumps({"ok": True, "data": {"success": True, "page_url": OFFICIAL_PROJECT_URL}}))
+                        if cmd == "execute_js":
+                            js = argv[5]
+                            if "execCommand('selectAll'" in js:
+                                return make_real_exec_js_proc({"ok": True})
+                            if "ClipboardEvent('paste'" in js:
+                                return make_real_exec_js_proc({"ok": True, "dispatched": True})
+                            if "draft_text: draftText" in js:
+                                return make_real_exec_js_proc(
+                                    {
+                                        "url": OFFICIAL_PROJECT_URL,
+                                        "editor_found": True,
+                                        "draft_text": prompt,
+                                        "send_button": {"found": True, "visible": True, "disabled": False, "aria_disabled": False},
+                                        "project_button": {"found": True, "text": "gemini-bridge", "aria_label": "Select project, current: gemini-bridge"},
+                                        "model_button": {"found": True, "text": "Gemini 4 Neon High", "aria_label": "Select model"},
+                                        "error_banners": [],
+                                        "dialog_texts": [],
+                                        "marker_in_conversation": False,
+                                    }
+                                )
+                            if "btn.click()" in js:
+                                clicks["count"] += 1
+                                return click_response
+                            if "has_stop_button" in js:
+                                return make_real_exec_js_proc(
+                                    {
+                                        "url": OFFICIAL_PROJECT_URL,
+                                        "running": False,
+                                        "error_banners": [],
+                                        "dialog_texts": [],
+                                        "turns": [],
+                                        "marker_in_conversation": False,
+                                    }
+                                )
+                        raise AssertionError(f"Unexpected call: {argv}")
+
+                    args = bridge.build_parser().parse_args(
+                        ["submit", "--contract", str(cpath), "--state-dir", str(state_dir), "--tab-id", "4"]
+                    )
+                    mcp = bridge.GitHubMcpClient(runner=gh.runner)
+                    browser = bridge.BrowserUseClient(runner=runner)
+
+                    c1, o1 = bridge.cmd_submit(args, mcp_client=mcp, browser_client=browser)
+                    self.assertEqual(c1, 3)
+                    self.assertEqual(o1["status"], "uncertain")
+                    self.assertEqual(clicks["count"], 1)
+
+                    journal = json.loads((state_dir / "jobs" / "calc-helper-v1.json").read_text(encoding="utf-8"))
+                    self.assertEqual(journal["attempts"]["1"]["state"], "submit_uncertain")
+                    self.assertTrue(journal["attempts"]["1"]["send_initiated"])
+
+                    # Second submit MUST NOT click again!
+                    c2, o2 = bridge.cmd_submit(args, mcp_client=mcp, browser_client=browser)
+                    self.assertEqual(c2, 3)
+                    self.assertEqual(o2["status"], "uncertain_no_double_submit")
+                    self.assertFalse(o2["sent"])
+                    self.assertEqual(clicks["count"], 1)
+
+    def test_a1_only_verified_pre_click_refusal_clears_send_initiated(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            contract = sample_contract()
+            cpath = write_contract(td_path, contract)
+            validated = bridge.validate_contract_dict(contract)
+            prompt = bridge.build_gemini_prompt(validated)
+            state_dir = td_path / "state"
+            gh = MockGitHubServer()
+
+            def runner(argv, timeout):
+                cmd = argv[1]
+                if cmd == "navigate":
+                    return make_proc(stdout=json.dumps({"ok": True, "data": {"success": True, "page_url": OFFICIAL_PROJECT_URL}}))
+                if cmd == "execute_js":
+                    js = argv[5]
+                    if "execCommand('selectAll'" in js:
+                        return make_real_exec_js_proc({"ok": True})
+                    if "ClipboardEvent('paste'" in js:
+                        return make_real_exec_js_proc({"ok": True, "dispatched": True})
+                    if "draft_text: draftText" in js:
+                        return make_real_exec_js_proc(
+                            {
+                                "url": OFFICIAL_PROJECT_URL,
+                                "editor_found": True,
+                                "draft_text": prompt,
+                                "send_button": {"found": True, "visible": True, "disabled": False, "aria_disabled": False},
+                                "project_button": {"found": True, "text": "gemini-bridge", "aria_label": "Select project, current: gemini-bridge"},
+                                "model_button": {"found": True, "text": "Gemini 4 Neon High", "aria_label": "Select model"},
+                                "error_banners": [],
+                                "dialog_texts": [],
+                                "marker_in_conversation": False,
+                            }
+                        )
+                    if "btn.click()" in js:
+                        return make_real_exec_js_proc({"clicked": False, "reason": "send_button_disabled"})
+                raise AssertionError(f"Unexpected call: {argv}")
+
+            args = bridge.build_parser().parse_args(
+                ["submit", "--contract", str(cpath), "--state-dir", str(state_dir), "--tab-id", "4"]
+            )
+            with self.assertRaises(bridge.BrowserError) as ctx:
+                bridge.cmd_submit(
+                    args,
+                    mcp_client=bridge.GitHubMcpClient(runner=gh.runner),
+                    browser_client=bridge.BrowserUseClient(runner=runner),
+                )
+            self.assertEqual(ctx.exception.code, "send_not_clicked")
+            journal = json.loads((state_dir / "jobs" / "calc-helper-v1.json").read_text(encoding="utf-8"))
+            self.assertEqual(journal["attempts"]["1"]["state"], "blocked_before_send")
+            self.assertFalse(journal["attempts"]["1"]["send_initiated"])
+
+    def test_a4_symlink_and_predictable_temp_escapes_rejected_without_touching_outside_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            outside_file = td_path / "outside.txt"
+            outside_file.write_text("ORIGINAL", encoding="utf-8")
+            outside_dir = td_path / "outside_dir"
+            outside_dir.mkdir()
+
+            # 1. Exact GPT repro: pre-created <name>.tmp.<pid> symlink must NOT overwrite outside.txt
+            collection = td_path / "collection"
+            collection.mkdir()
+            pid_symlink = collection / f"artifact.txt.tmp.{os.getpid()}"
+            os.symlink(str(outside_file), str(pid_symlink))
+            written = bridge._safe_write_collected_file(collection, "artifact.txt", "PROBE_WRITE")
+            self.assertEqual(outside_file.read_text(encoding="utf-8"), "ORIGINAL")
+            self.assertEqual(written.read_text(encoding="utf-8"), "PROBE_WRITE")
+
+            # 2. Direct destination symlink must be rejected
+            dest_symlink = collection / "linked.txt"
+            os.symlink(str(outside_file), str(dest_symlink))
+            with self.assertRaises(bridge.ValidationError) as ctx1:
+                bridge._safe_write_collected_file(collection, "linked.txt", "EVIL")
+            self.assertEqual(ctx1.exception.code, "symlink_rejected")
+            self.assertEqual(outside_file.read_text(encoding="utf-8"), "ORIGINAL")
+
+            # 3. Internal symlink overwriting sibling file must be rejected
+            res_target = collection / "result.json"
+            res_target.write_text("KEEP_RESULT", encoding="utf-8")
+            (collection / "src").mkdir()
+            os.symlink(str(res_target), str(collection / "src" / "calc.py"))
+            with self.assertRaises(bridge.ValidationError) as ctx2:
+                bridge._safe_write_collected_file(collection, "src/calc.py", "OVERWRITTEN")
+            self.assertEqual(ctx2.exception.code, "symlink_rejected")
+            self.assertEqual(res_target.read_text(encoding="utf-8"), "KEEP_RESULT")
+
+            # 4. Collection root symlink escape must be rejected
+            root_symlink = td_path / "collection_link"
+            os.symlink(str(outside_dir), str(root_symlink))
+            with self.assertRaises(bridge.ValidationError) as ctx3:
+                bridge._safe_write_collected_file(root_symlink, "src/calc.py", "ESCAPE")
+            self.assertEqual(ctx3.exception.code, "symlink_rejected")
+            self.assertEqual(list(outside_dir.iterdir()), [])
+
+            # 5. State dir & jobs dir symlinks must be rejected by JobJournal
+            state_link = td_path / "state_link"
+            os.symlink(str(outside_dir), str(state_link))
+            j_link = bridge.JobJournal(str(state_link))
+            with self.assertRaises(bridge.ValidationError) as ctx4:
+                j_link.save("calc-helper-v1", {"attempts": {}})
+            self.assertEqual(ctx4.exception.code, "symlink_rejected")
+
+            state_real = td_path / "state_real"
+            state_real.mkdir()
+            os.symlink(str(outside_dir), str(state_real / "jobs"))
+            j_jobs_link = bridge.JobJournal(str(state_real))
+            with self.assertRaises(bridge.ValidationError) as ctx5:
+                j_jobs_link.save("calc-helper-v1", {"attempts": {}})
+            self.assertEqual(ctx5.exception.code, "symlink_rejected")
+            self.assertEqual(list(outside_dir.iterdir()), [])
+
+            # 6. Regular caller-selected nested state dir works cleanly
+            regular_state = td_path / "nested" / "my-state"
+            j_ok = bridge.JobJournal(str(regular_state))
+            j_ok.save("calc-helper-v1", {"attempts": {"1": {"state": "created"}}})
+            loaded = j_ok.load("calc-helper-v1")
+            self.assertEqual(loaded["attempts"]["1"]["state"], "created")
+
+    def test_a2_exact_conversation_no_url_corruption_cross_attempt_mismatch_and_echo_filter(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            c1 = sample_contract(attempt=1)
+            c2 = sample_contract(attempt=2, goal="Revision 2")
+            c1_path = write_contract(td_path, c1, "c1.json")
+            v1 = bridge.validate_contract_dict(c1)
+            v2 = bridge.validate_contract_dict(c2)
+            state_dir = td_path / "state"
+
+            conv_aaa = f"{bridge.OFFICIAL_REMOTE_BASE}/conv-aaa?project={bridge.OFFICIAL_PROJECT_ID}"
+            conv_bbb = f"{bridge.OFFICIAL_REMOTE_BASE}/conv-bbb?project={bridge.OFFICIAL_PROJECT_ID}"
+
+            journal = bridge.JobJournal(str(state_dir))
+            job = journal.ensure_job(v1)
+            e1 = journal.ensure_attempt(job, v1)
+            e1["state"] = "submitted"
+            e1["conversation_url"] = conv_aaa
+            e2 = journal.ensure_attempt(job, v2)
+            e2["state"] = "submitted"
+            e2["conversation_url"] = conv_aaa
+            journal.save("calc-helper-v1", job)
+
+            # Cross-attempt --contract attempt1 + --attempt 2 MUST fail closed!
+            bad_args = bridge.build_parser().parse_args(
+                ["status", "--contract", str(c1_path), "--attempt", "2", "--state-dir", str(state_dir)]
+            )
+            with self.assertRaises(bridge.ValidationError) as ctx_att:
+                bridge.cmd_status(bad_args, browser_client=bridge.BrowserUseClient(runner=lambda a, t: make_proc()))
+            self.assertEqual(ctx_att.exception.code, "attempt_mismatch")
+
+            # Unrelated tab conv-bbb open (conv-aaa not open): must NOT return 'returned' or corrupt conv-aaa!
+            def wrong_tab_runner(argv, timeout):
+                if argv[1] == "list_tabs":
+                    return make_proc(
+                        stdout=json.dumps(
+                            {
+                                "ok": True,
+                                "data": {
+                                    "success": True,
+                                    "text": f"Open tabs:\n  Tab 9: Google Antigravity — {conv_bbb} *",
+                                },
+                            }
+                        )
+                    )
+                if argv[1] == "execute_js":
+                    return make_real_exec_js_proc(
+                        {
+                            "url": conv_bbb,
+                            "running": False,
+                            "error_banners": [],
+                            "dialog_texts": [],
+                            "turns": [
+                                {"role": "user", "text": "[GPT-GEMINI-TASK:other:attempt-01:999999999999] Other"},
+                                {"role": "assistant", "text": "Finished other task."},
+                            ],
+                            "marker_in_conversation": False,
+                        },
+                        tab_id=9,
+                        page_url=conv_bbb,
+                    )
+                raise AssertionError(f"Unexpected call: {argv}")
+
+            st_args = bridge.build_parser().parse_args(
+                ["status", "--task-id", "calc-helper-v1", "--attempt", "2", "--state-dir", str(state_dir)]
+            )
+            code, out = bridge.cmd_status(st_args, browser_client=bridge.BrowserUseClient(runner=wrong_tab_runner))
+            self.assertEqual(code, 2)
+            self.assertEqual(out["classification"], "blocked")
+            self.assertEqual(out["reason"], "conversation_tab_not_found")
+            saved = journal.load("calc-helper-v1")
+            self.assertEqual(saved["attempts"]["2"]["conversation_url"], conv_aaa)
+
+            # Prefixed prompt echo must NOT classify as returned
+            prefixed_env = bridge.parse_browser_envelope(
+                make_real_exec_js_proc(
+                    {
+                        "url": conv_aaa,
+                        "running": False,
+                        "error_banners": [],
+                        "dialog_texts": [],
+                        "turns": [
+                            {"role": "user", "text": f"[{v2['task_marker']}] Do task"},
+                            {"role": "assistant", "text": f"Echo: [{v2['task_marker']}] Do task"},
+                        ],
+                        "marker_in_conversation": True,
+                    },
+                    page_url=conv_aaa,
+                ).stdout
+            )
+            res_echo = bridge.classify_ui_status(prefixed_env, task_marker=v2["task_marker"])
+            self.assertEqual(res_echo["classification"], "blocked")
+
+            # Human-text fallback with '\n  tab_id: 4' trailer must NEVER leak tab_id into journal
+            human_env = bridge.parse_browser_envelope(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "data": {
+                            "success": True,
+                            "page_url": conv_aaa,
+                            "text": "Error: temporary glitch\n  tab_id: 4",
+                        },
+                    }
+                )
+            )
+            res_human = bridge.classify_ui_status(human_env, task_marker=v2["task_marker"])
+            self.assertNotIn("tab_id", res_human["evidence"])
+
+    def test_a6_post_send_requires_marker_pre_send_reconciles_and_fresh_state_dir_no_double_send(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            contract = sample_contract()
+            cpath = write_contract(td_path, contract)
+            validated = bridge.validate_contract_dict(contract)
+            prompt = bridge.build_gemini_prompt(validated)
+
+            # 1. Post-send running=True with marker_in_conversation=False MUST stay uncertain (exit 3)
+            state1 = td_path / "state1"
+            gh1 = MockGitHubServer()
+
+            def runner_no_marker_post(argv, timeout):
+                cmd = argv[1]
+                if cmd == "navigate":
+                    return make_proc(stdout=json.dumps({"ok": True, "data": {"success": True, "page_url": OFFICIAL_PROJECT_URL}}))
+                if cmd == "execute_js":
+                    js = argv[5]
+                    if "execCommand('selectAll'" in js:
+                        return make_real_exec_js_proc({"ok": True})
+                    if "ClipboardEvent('paste'" in js:
+                        return make_real_exec_js_proc({"ok": True, "dispatched": True})
+                    if "draft_text: draftText" in js:
+                        return make_real_exec_js_proc(
+                            {
+                                "url": OFFICIAL_PROJECT_URL,
+                                "editor_found": True,
+                                "draft_text": prompt,
+                                "send_button": {"found": True, "visible": True, "disabled": False, "aria_disabled": False},
+                                "project_button": {"found": True, "text": "gemini-bridge", "aria_label": "Select project, current: gemini-bridge"},
+                                "model_button": {"found": True, "text": "Gemini 4 Neon High", "aria_label": "Select model"},
+                                "error_banners": [],
+                                "dialog_texts": [],
+                                "marker_in_conversation": False,
+                            }
+                        )
+                    if "btn.click()" in js:
+                        return make_real_exec_js_proc({"clicked": True, "url": OFFICIAL_CONV_URL}, page_url=OFFICIAL_CONV_URL)
+                    if "has_stop_button" in js:
+                        return make_real_exec_js_proc(
+                            {
+                                "url": OFFICIAL_CONV_URL,
+                                "running": True,
+                                "has_stop_button": True,
+                                "error_banners": [],
+                                "dialog_texts": [],
+                                "turns": [],
+                                "marker_in_conversation": False,
+                            },
+                            page_url=OFFICIAL_CONV_URL,
+                        )
+                raise AssertionError(f"Unexpected call: {argv}")
+
+            args1 = bridge.build_parser().parse_args(
+                ["submit", "--contract", str(cpath), "--state-dir", str(state1), "--tab-id", "4"]
+            )
+            c_post, o_post = bridge.cmd_submit(
+                args1, mcp_client=bridge.GitHubMcpClient(runner=gh1.runner), browser_client=bridge.BrowserUseClient(runner=runner_no_marker_post)
+            )
+            self.assertEqual(c_post, 3)
+            self.assertEqual(o_post["status"], "uncertain")
+
+            # 2. Fresh --state-dir discovering existing remote attempt-01/task.json must NOT blindly click send!
+            state_fresh = td_path / "state_fresh"
+            clicks_fresh = {"n": 0}
+
+            def runner_fresh(argv, timeout):
+                if argv[1] == "list_tabs":
+                    return make_proc(
+                        stdout=json.dumps(
+                            {
+                                "ok": True,
+                                "data": {
+                                    "success": True,
+                                    "text": f"Open tabs:\n  Tab 4: Google Antigravity — {OFFICIAL_PROJECT_URL} *",
+                                },
+                            }
+                        )
+                    )
+                if argv[1] == "execute_js":
+                    if "btn.click()" in argv[5]:
+                        clicks_fresh["n"] += 1
+                    return make_real_exec_js_proc(
+                        {
+                            "url": OFFICIAL_PROJECT_URL,
+                            "running": False,
+                            "error_banners": [],
+                            "dialog_texts": [],
+                            "turns": [],
+                            "marker_in_conversation": False,
+                        }
+                    )
+                raise AssertionError(f"Fresh state-dir must not navigate/paste/click: {argv}")
+
+            args_fresh = bridge.build_parser().parse_args(
+                ["submit", "--contract", str(cpath), "--state-dir", str(state_fresh)]
+            )
+            c_fr, o_fr = bridge.cmd_submit(
+                args_fresh, mcp_client=bridge.GitHubMcpClient(runner=gh1.runner), browser_client=bridge.BrowserUseClient(runner=runner_fresh)
+            )
+            self.assertEqual(c_fr, 3)
+            self.assertEqual(o_fr["status"], "uncertain_no_double_submit")
+            self.assertEqual(clicks_fresh["n"], 0)
+
+            # 3. Multi-tab reconciliation finds marker on Tab 8 when Tab 4 is unrelated
+            conv_8 = f"{bridge.OFFICIAL_REMOTE_BASE}/conv-tab-8?project={bridge.OFFICIAL_PROJECT_ID}"
+
+            def runner_multi_tab(argv, timeout):
+                if argv[1] == "list_tabs":
+                    return make_proc(
+                        stdout=json.dumps(
+                            {
+                                "ok": True,
+                                "data": {
+                                    "success": True,
+                                    "text": (
+                                        "Open tabs:\n"
+                                        f"  Tab 4: Google Antigravity — {OFFICIAL_PROJECT_URL}\n"
+                                        f"  Tab 8: Google Antigravity — {conv_8} *"
+                                    ),
+                                },
+                            }
+                        )
+                    )
+                if argv[1] == "execute_js":
+                    tid = argv[3]
+                    if tid == "4":
+                        return make_real_exec_js_proc(
+                            {"url": OFFICIAL_PROJECT_URL, "running": False, "turns": [], "marker_in_conversation": False},
+                            tab_id=4,
+                        )
+                    if tid == "8":
+                        return make_real_exec_js_proc(
+                            {
+                                "url": conv_8,
+                                "running": True,
+                                "turns": [{"role": "user", "text": prompt}],
+                                "marker_in_conversation": True,
+                            },
+                            tab_id=8,
+                            page_url=conv_8,
+                        )
+                raise AssertionError(f"Unexpected call: {argv}")
+
+            c_rec, o_rec = bridge.cmd_submit(
+                args_fresh, mcp_client=bridge.GitHubMcpClient(runner=gh1.runner), browser_client=bridge.BrowserUseClient(runner=runner_multi_tab)
+            )
+            self.assertEqual(c_rec, 0)
+            self.assertEqual(o_rec["status"], "reconciled_already_submitted")
+            self.assertEqual(o_rec["conversation_url"], conv_8)
+
+    def test_a5_branch_scope_prior_snapshots_sanitized_tests_and_reject_self_sha(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            contract = sample_contract()
+            cpath = write_contract(td_path, contract)
+            validated = bridge.validate_contract_dict(contract)
+            state_dir = td_path / "state"
+
+            # 1. Self-referential commit SHA in result.json MUST be rejected
+            gh_sha = MockGitHubServer(enable_get_commit=True)
+            gh_sha.seed_file(validated["job_branch"], validated["task_snapshot_path"], bridge.build_snapshot_document(validated))
+            gh_sha.seed_file(validated["job_branch"], "src/calc.py", "def add(a,b): return a+b\n")
+            gh_sha.seed_file(validated["job_branch"], "tests/test_calc.py", "# test\n")
+            bad_res = {
+                "task_id": validated["task_id"],
+                "attempt": 1,
+                "contract_sha256": validated["contract_sha256"],
+                "status": "completed",
+                "summary": "Done",
+                "artifacts": ["src/calc.py", "tests/test_calc.py"],
+                "tests": {"passed": 1, "failed": 0},
+                "final_commit_sha": "a" * 40,
+            }
+            gh_sha.seed_file(validated["job_branch"], validated["result_snapshot_path"], json.dumps(bad_res))
+            args = bridge.build_parser().parse_args(["collect", "--contract", str(cpath), "--state-dir", str(state_dir)])
+            with self.assertRaises(bridge.ValidationError) as ctx_sha:
+                bridge.cmd_collect(args, mcp_client=bridge.GitHubMcpClient(runner=gh_sha.runner))
+            self.assertEqual(ctx_sha.exception.code, "self_referential_commit_sha")
+
+            # 2. Out-of-scope file (.github/workflows/evil.yml) committed on branch MUST be rejected!
+            gh_evil = MockGitHubServer(enable_get_commit=True)
+            gh_evil.seed_file(validated["job_branch"], validated["task_snapshot_path"], bridge.build_snapshot_document(validated))
+            gh_evil.seed_file(validated["job_branch"], "src/calc.py", "def add(a,b): return a+b\n")
+            gh_evil.seed_file(validated["job_branch"], "tests/test_calc.py", "# test\n")
+            gh_evil.seed_file(validated["job_branch"], ".github/workflows/evil.yml", "name: evil\n")
+            good_res = {
+                "task_id": validated["task_id"],
+                "attempt": 1,
+                "contract_sha256": validated["contract_sha256"],
+                "status": "completed",
+                "summary": "Done",
+                "artifacts": ["src/calc.py", "tests/test_calc.py"],
+                "tests": {"output": "leaked ghp_1234567890abcdef12345678 token", "passed": 1, "failed": 0},
+            }
+            gh_evil.seed_file(validated["job_branch"], validated["result_snapshot_path"], json.dumps(good_res))
+            with self.assertRaises(bridge.ValidationError) as ctx_scope:
+                bridge.cmd_collect(args, mcp_client=bridge.GitHubMcpClient(runner=gh_evil.runner))
+            self.assertEqual(ctx_scope.exception.code, "out_of_scope_branch_change")
+
+            # 3. Clean branch with get_commit enabled -> verified AND tests secrets sanitized!
+            gh_ok = MockGitHubServer(enable_get_commit=True)
+            gh_ok.seed_file(validated["job_branch"], validated["task_snapshot_path"], bridge.build_snapshot_document(validated))
+            gh_ok.seed_file(validated["job_branch"], "src/calc.py", "def add(a,b): return a+b\n")
+            gh_ok.seed_file(validated["job_branch"], "tests/test_calc.py", "# test\n")
+            gh_ok.seed_file(validated["job_branch"], validated["result_snapshot_path"], json.dumps(good_res))
+            c_ok, o_ok = bridge.cmd_collect(args, mcp_client=bridge.GitHubMcpClient(runner=gh_ok.runner))
+            self.assertEqual(c_ok, 0)
+            self.assertEqual(o_ok["branch_scope_status"], "verified")
+            self.assertTrue(o_ok["evidence"]["branch_write_scope_verified"])
+            self.assertNotIn("ghp_1234567890abcdef12345678", json.dumps(o_ok["tests"]))
+
+            # 4. When get_commit is unavailable -> explicitly reports scope_unverified!
+            gh_unver = MockGitHubServer(enable_get_commit=False)
+            gh_unver.seed_file(validated["job_branch"], validated["task_snapshot_path"], bridge.build_snapshot_document(validated))
+            gh_unver.seed_file(validated["job_branch"], "src/calc.py", "def add(a,b): return a+b\n")
+            gh_unver.seed_file(validated["job_branch"], "tests/test_calc.py", "# test\n")
+            gh_unver.seed_file(validated["job_branch"], validated["result_snapshot_path"], json.dumps(good_res))
+            c_uv, o_uv = bridge.cmd_collect(args, mcp_client=bridge.GitHubMcpClient(runner=gh_unver.runner))
+            self.assertEqual(c_uv, 0)
+            self.assertEqual(o_uv["branch_scope_status"], "scope_unverified")
+            self.assertFalse(o_uv["evidence"]["branch_write_scope_verified"])
+
+            # 5. Tampered attempt-01/task.json MUST fail both attempt-2 submit AND attempt-2 collect!
+            c2 = sample_contract(attempt=2, goal="Revision 2")
+            c2_path = write_contract(td_path, c2, "c2.json")
+            v2 = bridge.validate_contract_dict(c2)
+            gh_tamp = MockGitHubServer(enable_get_commit=True)
+            gh_tamp.seed_file(v2["job_branch"], validated["task_snapshot_path"], json.dumps({"tampered": True}))
+            gh_tamp.seed_file(v2["job_branch"], v2["task_snapshot_path"], bridge.build_snapshot_document(v2))
+            args2_sub = bridge.build_parser().parse_args(["submit", "--contract", str(c2_path), "--state-dir", str(state_dir)])
+            with self.assertRaises(bridge.ValidationError) as ctx_psub:
+                bridge.cmd_submit(
+                    args2_sub,
+                    mcp_client=bridge.GitHubMcpClient(runner=gh_tamp.runner),
+                    browser_client=bridge.BrowserUseClient(runner=lambda a, t: make_proc()),
+                )
+            self.assertEqual(ctx_psub.exception.code, "corrupted_remote_snapshot")
+
+            args2_col = bridge.build_parser().parse_args(["collect", "--contract", str(c2_path), "--state-dir", str(state_dir)])
+            with self.assertRaises(bridge.ValidationError) as ctx_pcol:
+                bridge.cmd_collect(args2_col, mcp_client=bridge.GitHubMcpClient(runner=gh_tamp.runner))
+            self.assertEqual(ctx_pcol.exception.code, "corrupted_remote_snapshot")
+
+    def test_a7_mcp_error_classification_and_strict_file_content_parser(self):
+        # Tool/server/repo not found must raise McpError (NOT return None from get_branch_head_sha!)
+        for err_msg in (
+            "Tool 'list_commits' not found",
+            "MCP server 'GitHub' not found",
+            "Repository not found",
+        ):
+            with self.subTest(err_msg=err_msg):
+                client = bridge.GitHubMcpClient(
+                    runner=lambda argv, timeout, m=err_msg: make_proc(
+                        stdout=json.dumps({"isError": True, "content": [{"type": "text", "text": m}]})
+                    )
+                )
+                with self.assertRaises(bridge.McpError) as ctx:
+                    client.get_branch_head_sha("gpt-gemini/jobs/t1")
+                self.assertNotIsInstance(ctx.exception, bridge.McpNotFoundError)
+
+        # data.success=false in MCP envelope must fail closed
+        with self.assertRaises(bridge.McpError):
+            bridge.unwrap_mcp_envelope(
+                json.dumps({"ok": True, "data": {"success": False, "text": "successfully downloaded text file"}})
+            )
+
+        # GitHub directory listing JSON array must be rejected
+        dir_env = bridge.unwrap_mcp_envelope(
+            json.dumps({"content": [{"type": "text", "text": json.dumps([{"type": "file", "name": "a.py", "path": "src/a.py"}])}]})
+        )
+        with self.assertRaises(bridge.McpError) as ctx_dir:
+            bridge.extract_file_text_from_mcp_envelope(dir_env, "src")
+        self.assertEqual(ctx_dir.exception.code, "mcp_unexpected_directory")
+
+        # GitHub symlink object must be rejected
+        sym_env = bridge.unwrap_mcp_envelope(
+            json.dumps(
+                {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {"type": "symlink", "target": "/etc/passwd", "path": "src/a.py", "sha": "a" * 40}
+                            ),
+                        }
+                    ]
+                }
+            )
+        )
+        with self.assertRaises(bridge.McpError) as ctx_sym:
+            bridge.extract_file_text_from_mcp_envelope(sym_env, "src/a.py")
+        self.assertEqual(ctx_sym.exception.code, "mcp_unexpected_file_type")
+
+        # Valid JSON artifact containing {"content": "INNER_ONLY", "path": "x", "sha": "y"} must NOT be mangled!
+        artifact_json = json.dumps({"content": "INNER_ONLY", "path": "x", "sha": "y"})
+        art_env = bridge.unwrap_mcp_envelope(json.dumps({"content": [{"type": "text", "text": artifact_json}]}))
+        self.assertEqual(bridge.extract_file_text_from_mcp_envelope(art_env, "data.json"), artifact_json)
+
+        # Status-only text without resource item must fail closed
+        status_only_env = bridge.unwrap_mcp_envelope(
+            json.dumps({"content": [{"type": "text", "text": "successfully downloaded text file (SHA: abc)"}]})
+        )
+        with self.assertRaises(bridge.McpError) as ctx_st:
+            bridge.extract_file_text_from_mcp_envelope(status_only_env, "src/a.py")
+        self.assertEqual(ctx_st.exception.code, "mcp_missing_file_content")
+
+    def test_a8_a9_snapshot_metadata_duplicate_keys_path_collisions_url_hardening_and_locking(self):
+        # 1. Tampered snapshot missing contract_sha256 or hijacked result_snapshot_path rejected
+        v = bridge.validate_contract_dict(sample_contract())
+        snap_doc = json.loads(bridge.build_snapshot_document(v))
+        no_hash = dict(snap_doc)
+        del no_hash["contract_sha256"]
+        with self.assertRaises(bridge.ValidationError) as ctx_nh:
+            bridge.validate_snapshot_matches_contract(json.dumps(no_hash), v["contract_sha256"])
+        self.assertEqual(ctx_nh.exception.code, "corrupted_remote_snapshot")
+
+        bad_res_path = dict(snap_doc, result_snapshot_path="evil/hijacked_result.json")
+        with self.assertRaises(bridge.ValidationError) as ctx_rp:
+            bridge.validate_snapshot_matches_contract(json.dumps(bad_res_path), v["contract_sha256"])
+        self.assertEqual(ctx_rp.exception.code, "corrupted_remote_snapshot")
+
+        # 2. Duplicate JSON keys rejected in contract loader
+        with tempfile.TemporaryDirectory() as td:
+            dup_path = Path(td) / "dup.json"
+            dup_path.write_text('{"task_id": "t1", "goal": "good", "goal": "evil"}', encoding="utf-8")
+            with self.assertRaises(bridge.ValidationError) as ctx_dup:
+                bridge.load_and_validate_contract(str(dup_path))
+            self.assertEqual(ctx_dup.exception.code, "malformed_json_duplicate_key")
+
+        # 3. Case-insensitive jobs/ bypass, case-colliding duplicates, and file/dir prefix collision rejected
+        with self.assertRaises(bridge.ValidationError):
+            bridge.validate_contract_dict(sample_contract(allowed_write_paths=["Jobs/calc-helper-v1/attempt-01/task.json"]))
+        with self.assertRaises(bridge.ValidationError):
+            bridge.validate_contract_dict(sample_contract(allowed_write_paths=["src/Calc.py", "src/calc.py"]))
+        with self.assertRaises(bridge.ValidationError) as ctx_pref:
+            bridge.validate_contract_dict(sample_contract(allowed_write_paths=["src/a", "src/a/b.py"]))
+        self.assertEqual(ctx_pref.exception.code, "path_prefix_collision")
+
+        # 4. Hardened official URL validation
+        for bad_url in (
+            "https://antigravity.google.com:8443/remote",
+            "https://@antigravity.google.com/remote",
+            "https://antigravity.google.com/remote/../signin",
+            "https://antigravity.google.com/remote//evil",
+            "https://antigravity.google.com/remote\nfoo",
+        ):
+            with self.subTest(bad_url=bad_url):
+                with self.assertRaises(bridge.ValidationError):
+                    bridge.validate_official_url(bad_url)
+
+        # 5. Snapshot already present on base_branch blocks attempt 1 creation
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cpath = write_contract(td_path, sample_contract())
+            gh_base = MockGitHubServer()
+            gh_base.seed_file("main", v["task_snapshot_path"], bridge.build_snapshot_document(v))
+            args = bridge.build_parser().parse_args(["submit", "--contract", str(cpath), "--state-dir", str(td_path / "st")])
+            with self.assertRaises(bridge.ValidationError) as ctx_base:
+                bridge.cmd_submit(
+                    args,
+                    mcp_client=bridge.GitHubMcpClient(runner=gh_base.runner),
+                    browser_client=bridge.BrowserUseClient(runner=lambda a, t: make_proc()),
+                )
+            self.assertEqual(ctx_base.exception.code, "snapshot_already_on_base_branch")
+
+        # 6. Advisory task lock rejects concurrent contention
+        with tempfile.TemporaryDirectory() as td:
+            j = bridge.JobJournal(td)
+            with j.lock_task("calc-helper-v1"):
+                with self.assertRaises(bridge.BridgeError) as ctx_lock:
+                    with j.lock_task("calc-helper-v1"):
+                        pass
+                self.assertEqual(ctx_lock.exception.code, "journal_locked")
 
 
 if __name__ == "__main__":

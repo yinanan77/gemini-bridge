@@ -1,19 +1,18 @@
 {
   "task_id": "bootstrap-gpt-gemini-v1",
-  "revision": 1,
+  "revision": 2,
   "repository": "yinanan77/gemini-bridge",
   "branch": "workflow/gpt-gemini-v1",
   "status": "completed",
-  "summary": "Applied targeted revision-01 fixes against real Minis CLI protocol and DOM fixtures: fixed minis-browser-use subcommands/flags (list_tabs, new_tab --url, navigate --tab-id --url, execute_js --tab-id --script), explicit top-level JS return statements, JSON + trailing tab_id suffix / page_url / data.success=false parsing, strict numeric tab ID parsing, real ?project= query URL, real Gemini 4 Neon High model selector button verification, anti-spoofing project/model validation, real data-testid DOM selectors, raw-string JS regex (eliminating \\x08 backspace escape), scoped error scanning excluding user prompt text, old assistant reply isolation, and Verify your account to continue. blocking.",
+  "summary": "Applied revision-02 security, idempotency, protocol, and collector fixes addressing orchestration/bootstrap/revision-02.md and reviews/bridge-v1-audit.md (A1, A2, A4, A5, A6, A7, A8, A9): fail-closed post-click uncertainty preservation, symlink/temp-file escape prevention with random O_EXCL|O_NOFOLLOW writes + fsync + per-task flock, exact conversation & cross-attempt marker/contract verification with stronger echo filter and no URL corruption, multi-tab read-only reconciliation for uncertain/fresh state dirs, collector branch write-scope audit (verified vs scope_unverified), prior attempt snapshot validation, sanitized tests field and rejection of self-referential commit SHA in result.json, strict GitHub MCP error classification & file-content parser, strict duplicate-key JSON parsing, case/prefix path collision rejection, and hardened official URL validation.",
   "revision_fixes": [
-    "BrowserUseClient switched to real minis-browser-use actions/flags: list_tabs, new_tab --url, navigate --tab-id ID --url URL, execute_js --tab-id ID --script SCRIPT with strict numeric tab_id validation.",
-    "All execute_js scripts now use explicit top-level return (() => { ... })(); and raw Python strings with zero ASCII control characters (eliminating the \\x08 backspace regex bug).",
-    "parse_browser_envelope now handles data.success=false, data.page_url, strict JSON + bounded trailing \\n  tab_id: N suffix, and fail-closed null return handling.",
-    "parse_tabs_from_envelope strictly parses real 'Tab N: Title — URL [*]' and 'Opened new tab N at URL' lines into numeric tab IDs and rejects malformed/ambiguous tab lines.",
-    "Updated default project URL to https://antigravity.google.com/remote?project=561adc82-06e6-4c8c-862f-3ac493b947c1 and default model to Gemini 4 Neon High; project and model verification now strictly inspect URL ?project= / project selector and model selector button only (never spoofable via prompt/body text).",
-    "Updated DOM selectors to real page attributes ([contenteditable=true][aria-label=\"Message input\"], button[data-testid=\"model-selector-trigger\"], button[aria-label^=\"Select model\"], button[aria-label^=\"Select project, current:\"], [data-testid=\"user-message\"], [data-testid=\"user-message-content\"], [data-testid=\"agent-response\"], button[aria-label=\"Send message\"], button[data-testid=\"send-button\"], button[aria-label=\"Cancel (Ctrl+D)\"]).",
-    "Scoped error/auth detection to explicit banners, dialogs, URL, and assistant replies AFTER task_marker; added 'Verify your account to continue.' detection while preventing user task text from triggering false blocks and preventing old assistant replies from marking a new task returned.",
-    "Added regression tests directly exercising committed orchestration/bootstrap/protocol-fixtures.json."
+    "A1 (Fail-closed post-click uncertainty): cmd_submit now clears send_initiated=False ONLY on verified pre-click refusal ({clicked: False, reason: 'send_button_not_found' | 'send_button_disabled'}); any null, malformed, missing-clicked, or unknown post-click result remains state='submit_uncertain', send_initiated=True (exit 3) so retries reconcile read-only and never double-send.",
+    "A4 (Symlink/temp escape prevention, durability, locking): replaced predictable .tmp writes with random-suffix O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW (0o600) + fsync + os.replace + parent dir fsync; validated state_dir, jobs/, collected/, collect_root, intermediate directories, and target files against symlinks; wrapped OSError in BridgeError; added O_NOFOLLOW reads and non-blocking fcntl.flock per-task locking (journal_locked).",
+    "A2 & A6 (Exact conversation/attempt verification, echo filter, idempotency): cmd_status rejects --contract + mismatched --attempt, never falls back to unrelated tabs, and updates conversation_url only when marker_in_conversation is True; stronger _is_prompt_echo filter and tab_id trailer stripping; classify_ui_status requires marker_in_conversation=True for returned; cmd_submit post-send confirmation requires marker_in_conversation=True; pre-send inspection reconciles immediately if marker is already present; bounded multi-tab read-only reconciliation handles submit_uncertain and fresh --state-dir encountering an existing remote task.json.",
+    "A5 (Collector branch scope, prior snapshots, sanitized tests, no self-referential SHA): added branch write-scope audit via list_commits/get_commit rejecting unauthorized changed files (out_of_scope_branch_change) or explicitly reporting branch_scope_status='scope_unverified' and evidence.branch_write_scope_verified=False when unavailable; verified all prior attempt-01..attempt-(N-1)/task.json snapshots in submit and collect; recursively sanitized/bounded result.json['tests']; rejected self-referential commit SHA keys in result.json (self_referential_commit_sha).",
+    "A7 (MCP error classification & strict file parser): unwrap_mcp_envelope inspects ok/isError/success/error at nested data/result levels; tool/server/binary/repository not-found errors are never misclassified as file McpNotFoundError; extract_file_text_from_mcp_envelope rejects directory listings, non-file types (dir/symlink/submodule), and status-only text while preserving valid JSON artifacts.",
+    "A8 & A9 (Snapshot metadata, strict JSON, path collisions, URL hardening): added loads_json_strict rejecting duplicate JSON keys; validate_snapshot_matches_contract enforces exact contract_sha256 and snapshot paths; attempt 1 verifies task_snapshot_path does not already exist on base_branch; validate_relative_path blocks jobs/ case-insensitively and rejects case-insensitive duplicates and file/dir prefix collisions; validate_official_url rejects whitespace/control chars, userinfo (@), non-443 ports, backslashes, double slashes, and dot segments.",
+    "Added 8 comprehensive regression tests in TestRevision02SecurityAndAuditRegressions covering A1, A2, A4, A5, A6, A7, A8, and A9 (41 total unit tests passing)."
   ],
   "files": [
     "bridge/minis_gemini_bridge.py",
@@ -26,13 +25,14 @@
     "orchestration/bootstrap/task.json",
     "orchestration/bootstrap/revision-01.md",
     "orchestration/bootstrap/protocol-fixtures.json",
+    "orchestration/bootstrap/revision-02.md",
     "README.md"
   ],
   "tests": {
     "compile_command": "python3 -m py_compile bridge/minis_gemini_bridge.py",
     "compile_exit_code": 0,
     "unit_test_command": "python3 -m unittest discover -s bridge -p test_bridge.py",
-    "passed": 33,
+    "passed": 41,
     "failed": 0,
     "errors": 0,
     "fixture_file_tested": "orchestration/bootstrap/protocol-fixtures.json",
@@ -43,8 +43,8 @@
   },
   "runtime_unverified_limitations": [
     "Local Minis executables (minis-browser-use and minis-mcp-cli) are unavailable in this cloud sandbox; unit and fixture regression tests run against recorded fixtures and mocks only.",
-    "Live end-to-end execution of list_tabs, new_tab, navigate, execute_js (focus+selectAll, ClipboardEvent paste, draft/model/project/send inspection, click, status) against the live Antigravity page on iOS Minis has not been executed from this sandbox.",
-    "Live GitHub MCP create_branch/create_or_update_file/list_commits/get_file_contents calls on iOS Minis have not been executed end-to-end from this sandbox.",
+    "Live Minis minis-mcp-cli tool schemas and response envelopes (including whether get_commit returns a files list for branch write-scope verification) have not yet been captured as fixtures or exercised live from this sandbox.",
+    "Live end-to-end execution of a real new job (submit -> status -> collect) against the live Antigravity page and GitHub MCP on iOS Minis has not been executed from this sandbox and will be verified by GPT on Minis.",
     "Human sign-in/verification handling, Pro quota enforcement, and iOS app suspension/resume require live runtime verification by GPT on Minis."
   ]
 }
