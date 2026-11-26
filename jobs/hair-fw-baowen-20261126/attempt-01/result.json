@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "task_id": "hair-fw-baowen-20261126",
+  "attempt": 1,
+  "contract_sha256": "1842a5b689887d7d55ba8d91d891eecca2961b9d9d728620c32b91a02759de71",
+  "status": "completed",
+  "summary": "按诊断完成豹纹主题纠偏修订：重写 text-v4-20261126/TRIAL.md 撤掉“你挑/我拎/绕一圈/指左边”偏题剧情与“光换件衣服还不够”空转句，回归“外形气场与存在感→重心上移、浅金弯曲碎发露额→外形锋芒与相处温度→看起来很难管、但愿意陪她多逛两家店”的原作审美主线，且“颜色换成浅金”恰好出现一次、造型事实不超原作清单；更新 FRAMEWORK.md 完整保留基线全部模块并补充“仿写先核对主题／前后呼应不能靠回扣新造故事证明”方法，清除对偏题试稿的正向引述且未新增绝对数量禁令；更新 MOTHER.md 逐字保留 18 个单元的定位、原句、槽位、承上启下及顺序，去掉偏题试稿正向引述并补充适配前主题核对说明；在 CHANGES.md 逐条记录改动、主题保留及“未偏题”自检结论。",
+  "artifacts": [
+    "text-v4-20261126/FRAMEWORK.md",
+    "text-v4-20261126/MOTHER.md",
+    "text-v4-20261126/TRIAL.md",
+    "text-v4-20261126/CHANGES.md"
+  ],
+  "tests": [
+    {
+      "command": "python3 inline acceptance verification script checking deliverables existence/size, MOTHER.md 18-unit verbatim parity, FRAMEWORK.md module retention & no off-topic positive citations & quote parity with TRIAL.md, TRIAL.md forbidden-string exclusion & exact 1x lock phrase & styling-fact boundaries & theme landing, and CHANGES.md completeness",
+      "passed": 95,
+      "failed": 0
+    }
+  ],
+  "self_check": {
+    "off_topic": false,
+    "mother_18_units_verbatim_match": true,
+    "trial_lock_phrase_count": 1,
+    "trial_forbidden_phrases_present": false,
+    "styling_facts_within_original": true,
+    "non_authorized_files_untouched": true
+  }
+}
