@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "task_id": "hair-fw-baowen-20261126-audit",
+  "attempt": 1,
+  "contract_sha256": "0abbacc33c093b0d91a6470c798e14c587d74d8819bb7c0c10958ac9e3d82d49",
+  "status": "completed",
+  "summary": "已完成对分支 gpt-gemini/jobs/hair-fw-baowen-20261126（提交 64cef8ee35ca21c9d634c5ffbb8335cda06efea3）下 text-v4-20261126/ 四份文稿的只读独立审核，未修改任何作者正文，并输出 text-v4-20261126/AUDIT-20261126.md。审核结论为“需修（仅限 2 处轻量精度必改项；5 大核心审查维度实质内容均已通过，无需重写演练正文）”：已确认无偏题剧情残留、无造型越界、“颜色换成浅金”在 TRIAL.md 恰出现 1 次且虚构场景已标明、MOTHER.md 18 单元的定位/原句/槽位/承上启下/顺序与基线 0 差异、FRAMEWORK.md 完整保留基线全部实质模块且未缩成提纲或新增绝对数量禁令、四份文件均标注候选/未认可状态且无效果过度声明；同时查出 2 处必须修正的轻量精度问题（TRIAL.md L30–31 原作行号切分偏移 1 行应为 L138–145 与 L146–149；FRAMEWORK.md L152“核……源文件”表述超出本仓实际附带文件范围），并逐条列出未验证项。",
+  "artifacts": [
+    "text-v4-20261126/AUDIT-20261126.md"
+  ],
+  "tests": [
+    {
+      "command": "git fetch origin gpt-gemini/jobs/hair-fw-baowen-20261126 && git diff HEAD FETCH_HEAD -- inputs/hair-fw-20261126/",
+      "passed": 1,
+      "failed": 0
+    },
+    {
+      "command": "python3 scratch/audit_check.py (diffing MOTHER.md/FRAMEWORK.md against baselines, scanning TRIAL.md styling/forbidden/lock phrases, verifying claims & candidate markings)",
+      "passed": 1,
+      "failed": 0
+    },
+    {
+      "command": "python3 scratch/verify_audit.py (77 assertions verifying contract_sha256, branch, 5 audit criteria against target files, off-by-one L145/L146 evidence, AUDIT-20261126.md completeness, repo write-boundary hygiene, and result.json schema)",
+      "passed": 77,
+      "failed": 0
+    },
+    {
+      "command": "python3 -m json.tool jobs/hair-fw-baowen-20261126-audit/attempt-01/result.json > /dev/null",
+      "passed": 1,
+      "failed": 0
+    }
+  ],
+  "self_check": {
+    "audited_branch": "gpt-gemini/jobs/hair-fw-baowen-20261126",
+    "audited_commit": "64cef8ee35ca21c9d634c5ffbb8335cda06efea3",
+    "audit_verdict": "需修（仅限2处轻量精度必改；5项核心实质内容均通过）",
+    "off_topic_plot_remaining": false,
+    "styling_fact_out_of_bounds": false,
+    "trial_lock_phrase_exact_once": true,
+    "mother_18_units_verbatim_intact": true,
+    "framework_modules_intact": true,
+    "new_absolute_quantity_prohibitions": false,
+    "overclaim_quality_or_traffic": false,
+    "candidate_unapproved_status_marked": true,
+    "must_fix_count": 2,
+    "author_content_modified": false,
+    "only_authorized_files_written": true
+  }
+}
