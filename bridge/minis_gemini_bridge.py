@@ -19,7 +19,7 @@ import re
 import subprocess
 import sys
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 
 FIXED_REPO = "yinanan77/gemini-bridge"
@@ -36,12 +36,16 @@ MAX_TIMEOUT_SECONDS = 120
 OFFICIAL_HOST = "antigravity.google.com"
 OFFICIAL_REMOTE_BASE = "https://antigravity.google.com/remote"
 OFFICIAL_PROJECT_ID = "561adc82-06e6-4c8c-862f-3ac493b947c1"
-DEFAULT_PROJECT_URL = f"{OFFICIAL_REMOTE_BASE}/projects/{OFFICIAL_PROJECT_ID}"
-DEFAULT_EXPECTED_MODEL = "Pro"
+DEFAULT_PROJECT_URL = f"{OFFICIAL_REMOTE_BASE}?project={OFFICIAL_PROJECT_ID}"
+DEFAULT_EXPECTED_MODEL = "Gemini 4 Neon High"
 
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+TAB_ID_RE = re.compile(r"^[0-9]+$")
+TAB_SUFFIX_RE = re.compile(r"\r?\n[ \t]*tab_id:[ \t]*([0-9]+)[ \t]*$")
+LIST_TAB_LINE_RE = re.compile(r"^\s*Tab\s+([0-9]+)\s*:\s*(.*?)\s+(?:—|-|\|)\s+(https?://\S+?)(?:\s+\*)?\s*$")
+NEW_TAB_LINE_RE = re.compile(r"^\s*Opened\s+new\s+tab\s+([0-9]+)\s+at\s+(https?://\S+)\s*$", re.IGNORECASE)
 OFFICIAL_URL_IN_TEXT_RE = re.compile(r"https://antigravity\.google\.com/remote[^\s\"'<>]*")
 
 RESERVED_TASK_IDS = {"main", "master", "head"}
@@ -95,7 +99,12 @@ REDACT_PATTERNS = [
 ]
 
 AUTH_BLOCK_PATTERNS = [
-    re.compile(r"(?i)\b(?:sign\s*in|log\s*in|verify\s+you\s+are\s+human|captcha|recaptcha|hcaptcha|turnstile|two-factor|2fa|session\s+expired|re-authenticate|authentication\s+required)\b"),
+    re.compile(
+        r"(?i)\b(?:verify\s+your\s+account(?:\s+to\s+continue)?|verify\s+you\s+are\s+human|"
+        r"sign\s*in(?:\s+to\s+continue|\s+required)?|log\s*in(?:\s+to\s+continue|\s+required)?|"
+        r"captcha|recaptcha|hcaptcha|turnstile|two-factor|2fa|"
+        r"session\s+expired|re-authenticate|authentication\s+required)\b"
+    ),
 ]
 QUOTA_BLOCK_PATTERNS = [
     re.compile(r"(?i)\b(?:quota\s+exceeded|rate\s+limit|usage\s+limit|out\s+of\s+credits|add\s+credits|buy\s+credits|upgrade\s+plan|billing\s+required|payment\s+required|pro\s+subscription\s+unavailable|limit\s+reached)\b"),
@@ -193,6 +202,30 @@ def validate_official_url(url: str, label: str = "URL") -> str:
             f"{label} path must stay under /remote.",
         )
     return cleaned
+
+
+def validate_tab_id(tab_id: Any) -> str:
+    if isinstance(tab_id, bool):
+        raise ValidationError("invalid_tab_id", "tab_id must be a numeric tab identifier, not boolean.")
+    if isinstance(tab_id, int):
+        if tab_id < 0:
+            raise ValidationError("invalid_tab_id", "tab_id must be a non-negative integer.")
+        return str(tab_id)
+    if isinstance(tab_id, str):
+        cleaned = tab_id.strip()
+        if TAB_ID_RE.match(cleaned):
+            return cleaned
+    raise ValidationError("invalid_tab_id", f"tab_id must be a strict numeric identifier (got {tab_id!r}).")
+
+
+def extract_url_project_id(url: str) -> Optional[str]:
+    if not isinstance(url, str) or not url.strip():
+        return None
+    parsed = urlparse(url.strip())
+    vals = parse_qs(parsed.query).get("project")
+    if vals and vals[0].strip():
+        return vals[0].strip()
+    return None
 
 
 def validate_task_id(task_id: Any) -> str:
@@ -899,8 +932,15 @@ def extract_file_text_from_mcp_envelope(env: Dict[str, Any], expected_path: str)
     raise McpError("mcp_missing_file_content", f"No file content found in MCP response for {expected_path}.")
 
 
+def _strip_tab_id_suffix(text: str) -> Tuple[str, Optional[str]]:
+    match = TAB_SUFFIX_RE.search(text)
+    if not match:
+        return text, None
+    return text[: match.start()], match.group(1)
+
+
 def parse_browser_envelope(raw_stdout: str) -> Dict[str, Any]:
-    """Parse minis-browser-use stdout tolerating structured JSON or data.text (JSON or human text)."""
+    """Parse minis-browser-use stdout tolerating real JSON envelope, page_url, and trailing tab_id suffix."""
     if not raw_stdout or not raw_stdout.strip():
         raise BrowserError("browser_empty_output", "minis-browser-use returned empty output.")
     stripped = raw_stdout.strip()
@@ -909,10 +949,10 @@ def parse_browser_envelope(raw_stdout: str) -> Dict[str, Any]:
     except json.JSONDecodeError as exc:
         if stripped.startswith("{") or stripped.startswith("["):
             raise BrowserError("browser_malformed_json", f"minis-browser-use returned malformed JSON: {exc}") from exc
-        return {"parsed": None, "human_text": stripped, "raw": stripped}
+        return {"parsed": None, "parsed_is_null": False, "human_text": stripped, "page_url": None, "tab_id": None, "raw": stripped}
 
     if not isinstance(parsed, dict):
-        return {"parsed": parsed, "human_text": None, "raw": parsed}
+        return {"parsed": parsed, "parsed_is_null": parsed is None, "human_text": None, "page_url": None, "tab_id": None, "raw": parsed}
 
     if parsed.get("ok") is False:
         err = parsed.get("error") or parsed.get("message") or "Browser action failed."
@@ -927,38 +967,113 @@ def parse_browser_envelope(raw_stdout: str) -> Dict[str, Any]:
             break
 
     if isinstance(container, str):
+        body, suffix_tid = _strip_tab_id_suffix(container)
         try:
-            inner_json = json.loads(container)
-            return {"parsed": inner_json, "human_text": None, "raw": parsed}
-        except json.JSONDecodeError:
-            return {"parsed": None, "human_text": container, "raw": parsed}
+            inner_json = json.loads(body)
+            return {
+                "parsed": inner_json,
+                "parsed_is_null": inner_json is None,
+                "human_text": None,
+                "page_url": None,
+                "tab_id": suffix_tid,
+                "raw": parsed,
+            }
+        except json.JSONDecodeError as exc:
+            if body.lstrip().startswith("{") or body.lstrip().startswith("["):
+                raise BrowserError("browser_malformed_json", f"Malformed JSON in browser text: {exc}") from exc
+            return {
+                "parsed": None,
+                "parsed_is_null": False,
+                "human_text": body,
+                "page_url": None,
+                "tab_id": suffix_tid,
+                "raw": parsed,
+            }
 
     if isinstance(container, dict):
+        if container.get("success") is False:
+            err = container.get("error") or container.get("message") or container.get("text") or "Browser data.success is false."
+            raise BrowserError("browser_action_failed", str(err))
+
+        page_url = container.get("page_url") if isinstance(container.get("page_url"), str) else None
+        if page_url is None and isinstance(container.get("url"), str):
+            page_url = container["url"]
+
+        container_tid: Optional[str] = None
+        for tk in ("tab_id", "tabId"):
+            if container.get(tk) is not None:
+                container_tid = validate_tab_id(container[tk])
+                break
+
         if isinstance(container.get("text"), str):
-            text_val = container["text"]
+            body, suffix_tid = _strip_tab_id_suffix(container["text"])
+            effective_tid = suffix_tid or container_tid
             try:
-                inner_json = json.loads(text_val)
+                inner_json = json.loads(body)
+                if inner_json is None:
+                    return {
+                        "parsed": None,
+                        "parsed_is_null": True,
+                        "human_text": None,
+                        "page_url": page_url,
+                        "tab_id": effective_tid,
+                        "raw": parsed,
+                    }
                 if isinstance(inner_json, dict):
                     merged = dict(inner_json)
-                    if "url" not in merged and isinstance(container.get("url"), str):
-                        merged["url"] = container["url"]
-                    if "tab_id" not in merged and (container.get("tab_id") or container.get("tabId")):
-                        merged["tab_id"] = str(container.get("tab_id") or container.get("tabId"))
-                    return {"parsed": merged, "human_text": None, "raw": parsed}
-                return {"parsed": inner_json, "human_text": None, "raw": parsed}
-            except json.JSONDecodeError:
+                    if page_url is not None:
+                        if "page_url" not in merged:
+                            merged["page_url"] = page_url
+                        if "url" not in merged:
+                            merged["url"] = page_url
+                    return {
+                        "parsed": merged,
+                        "parsed_is_null": False,
+                        "human_text": None,
+                        "page_url": page_url,
+                        "tab_id": effective_tid,
+                        "raw": parsed,
+                    }
                 return {
-                    "parsed": {k: v for k, v in container.items() if k != "text"},
-                    "human_text": text_val,
+                    "parsed": inner_json,
+                    "parsed_is_null": False,
+                    "human_text": None,
+                    "page_url": page_url,
+                    "tab_id": effective_tid,
                     "raw": parsed,
                 }
-        return {"parsed": container, "human_text": None, "raw": parsed}
+            except json.JSONDecodeError as exc:
+                if body.lstrip().startswith("{") or body.lstrip().startswith("["):
+                    raise BrowserError("browser_malformed_json", f"Malformed JSON in browser data.text: {exc}") from exc
+                return {
+                    "parsed": {k: v for k, v in container.items() if k != "text"},
+                    "parsed_is_null": False,
+                    "human_text": body,
+                    "page_url": page_url,
+                    "tab_id": effective_tid,
+                    "raw": parsed,
+                }
+        return {
+            "parsed": container,
+            "parsed_is_null": False,
+            "human_text": None,
+            "page_url": page_url,
+            "tab_id": container_tid,
+            "raw": parsed,
+        }
 
-    return {"parsed": container, "human_text": None, "raw": parsed}
+    return {
+        "parsed": container,
+        "parsed_is_null": container is None,
+        "human_text": None,
+        "page_url": None,
+        "tab_id": None,
+        "raw": parsed,
+    }
 
 
 def parse_tabs_from_envelope(env: Dict[str, Any]) -> List[Dict[str, str]]:
-    """Extract normalized [{tab_id, url, title}] from structured or human-readable tab output."""
+    """Extract normalized [{tab_id, url, title}] using strict numeric tab IDs."""
     tabs: List[Dict[str, str]] = []
     parsed = env.get("parsed")
     candidates: List[Any] = []
@@ -969,36 +1084,60 @@ def parse_tabs_from_envelope(env: Dict[str, Any]) -> List[Dict[str, str]]:
             if isinstance(parsed.get(key), list):
                 candidates = parsed[key]
                 break
-        if not candidates and (parsed.get("tab_id") or parsed.get("tabId") or parsed.get("id")) and parsed.get("url"):
+        if (
+            not candidates
+            and (parsed.get("tab_id") is not None or parsed.get("tabId") is not None or parsed.get("id") is not None)
+            and (isinstance(parsed.get("url"), str) or isinstance(parsed.get("page_url"), str))
+        ):
             candidates = [parsed]
 
     for item in candidates:
         if not isinstance(item, dict):
-            continue
-        tid = item.get("tab_id") or item.get("tabId") or item.get("id")
-        url = item.get("url")
-        if tid is not None and isinstance(url, str):
-            tabs.append({"tab_id": str(tid), "url": url, "title": str(item.get("title") or "")})
+            raise BrowserError("malformed_tab_output", "Tab list entry must be an object.")
+        tid = item.get("tab_id") if item.get("tab_id") is not None else item.get("tabId")
+        if tid is None:
+            tid = item.get("id")
+        url = item.get("url") if isinstance(item.get("url"), str) else item.get("page_url")
+        if tid is None or not isinstance(url, str):
+            raise BrowserError("malformed_tab_output", "Structured tab entry missing numeric tab_id or url.")
+        tabs.append({"tab_id": validate_tab_id(tid), "url": url.strip(), "title": str(item.get("title") or "")})
 
     if not tabs and isinstance(env.get("human_text"), str):
-        for line in env["human_text"].splitlines():
-            url_match = OFFICIAL_URL_IN_TEXT_RE.search(line)
-            if not url_match:
+        seen_ids: Dict[str, str] = {}
+        for raw_line in env["human_text"].splitlines():
+            line = raw_line.strip()
+            if not line or line.lower() == "open tabs:":
                 continue
-            tid_match = re.search(r"(?:tab[_-]?id\s*[:=]\s*|\[|#)?([A-Za-z0-9_-]{1,64})", line.strip())
-            if tid_match:
-                tabs.append({"tab_id": tid_match.group(1), "url": url_match.group(0), "title": line.strip()})
+            m_list = LIST_TAB_LINE_RE.match(raw_line)
+            if m_list:
+                tid = validate_tab_id(m_list.group(1))
+                title = m_list.group(2).strip()
+                url = m_list.group(3).strip()
+                if tid in seen_ids and seen_ids[tid] != url:
+                    raise BrowserError("ambiguous_tab_output", f"Conflicting duplicate tab_id {tid} in list_tabs.")
+                seen_ids[tid] = url
+                tabs.append({"tab_id": tid, "url": url, "title": title})
+                continue
+            m_new = NEW_TAB_LINE_RE.match(raw_line)
+            if m_new:
+                tid = validate_tab_id(m_new.group(1))
+                url = m_new.group(2).strip()
+                seen_ids[tid] = url
+                tabs.append({"tab_id": tid, "url": url, "title": ""})
+                continue
+            if re.match(r"(?i)^(?:tab\b|opened\s+new\s+tab\b)", line):
+                raise BrowserError("malformed_tab_output", f"Unrecognized tab line format: {sanitize_text(line, max_len=160)}")
     return tabs
 
 
 JS_FIND_EDITOR_SNIPPET = r"""
 function findEditor() {
   const selectors = [
-    'textarea:not([disabled])',
+    '[contenteditable="true"][aria-label="Message input"]',
+    '[contenteditable="true"][role="combobox"]',
     '[contenteditable="true"][role="textbox"]',
-    '[role="textbox"][contenteditable="true"]',
-    '[contenteditable="true"]',
-    '[role="textbox"]'
+    'textarea[aria-label="Message input"]:not([disabled])',
+    'textarea:not([disabled])'
   ];
   for (const sel of selectors) {
     const nodes = Array.from(document.querySelectorAll(sel));
@@ -1016,18 +1155,18 @@ function findEditor() {
 
 JS_FIND_SEND_SNIPPET = r"""
 function findSendButton() {
-  const candidates = Array.from(document.querySelectorAll('button, [role="button"]'));
-  for (const btn of candidates) {
-    const label = (
-      (btn.getAttribute('aria-label') || '') + ' ' +
-      (btn.getAttribute('title') || '') + ' ' +
-      (btn.innerText || btn.textContent || '')
-    ).trim();
-    const r = btn.getBoundingClientRect();
-    const style = window.getComputedStyle(btn);
-    const visible = r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
-    if (!visible) continue;
-    if (/\b(?:send|submit)\b/i.test(label) || btn.getAttribute('data-testid') === 'send-button') {
+  const selectors = [
+    'button[aria-label="Send message"]',
+    'button[data-testid="send-button"]'
+  ];
+  for (const sel of selectors) {
+    const nodes = Array.from(document.querySelectorAll(sel));
+    for (const btn of nodes) {
+      const r = btn.getBoundingClientRect();
+      const style = window.getComputedStyle(btn);
+      const visible = r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+      if (!visible) continue;
+      const label = ((btn.getAttribute('aria-label') || '') + ' ' + (btn.innerText || btn.textContent || '')).trim();
       return { btn, label, visible };
     }
   }
@@ -1036,9 +1175,9 @@ function findSendButton() {
 """
 
 JS_FOCUS_SELECT_ALL = (
-    "(() => {"
+    "return (() => {"
     + JS_FIND_EDITOR_SNIPPET
-    + """
+    + r"""
   const el = findEditor();
   if (!el) return JSON.stringify({ok: false, found: false, reason: 'editor_not_found'});
   el.focus();
@@ -1048,87 +1187,96 @@ JS_FOCUS_SELECT_ALL = (
     found: true,
     selected: Boolean(selected),
     tag: el.tagName.toLowerCase(),
+    role: el.getAttribute('role') || '',
     content_editable: Boolean(el.isContentEditable)
   });
-})()"""
+})();"""
 )
 
 
 def build_paste_js(prompt_text: str) -> str:
     encoded = json.dumps(prompt_text).replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
-    return (
-        "(() => {"
-        + JS_FIND_EDITOR_SNIPPET
-        + f"""
-  const text = {encoded};
+    body = r"""
+  const text = __PROMPT__;
   const active = document.activeElement;
-  const target = (active && (active.tagName === 'TEXTAREA' || active.isContentEditable || active.getAttribute('role') === 'textbox'))
+  const activeRole = active ? (active.getAttribute('role') || '') : '';
+  const target = (active && (active.tagName === 'TEXTAREA' || active.isContentEditable || activeRole === 'combobox' || activeRole === 'textbox'))
     ? active
     : findEditor();
-  if (!target) return JSON.stringify({{ok: false, dispatched: false, reason: 'editor_not_found'}});
+  if (!target) return JSON.stringify({ok: false, dispatched: false, reason: 'editor_not_found'});
   const dt = new DataTransfer();
   dt.setData('text/plain', text);
-  const ev = new ClipboardEvent('paste', {{clipboardData: dt, bubbles: true, cancelable: true}});
+  const ev = new ClipboardEvent('paste', {clipboardData: dt, bubbles: true, cancelable: true});
   target.dispatchEvent(ev);
-  return JSON.stringify({{ok: true, dispatched: true, expected_length: text.length}});
-}})()"""
-    )
+  return JSON.stringify({ok: true, dispatched: true, expected_length: text.length});
+})();"""
+    return "return (() => {" + JS_FIND_EDITOR_SNIPPET + body.replace("__PROMPT__", encoded)
 
 
 def build_inspect_draft_js(task_marker: str) -> str:
     encoded_marker = json.dumps(task_marker)
-    return (
-        "(() => {"
-        + JS_FIND_EDITOR_SNIPPET
-        + JS_FIND_SEND_SNIPPET
-        + f"""
-  const marker = {encoded_marker};
+    body = r"""
+  const marker = __MARKER__;
   const editor = findEditor();
   let draftText = '';
-  if (editor) {{
+  if (editor) {
     draftText = (editor.tagName === 'TEXTAREA' || editor.tagName === 'INPUT')
       ? String(editor.value || '')
       : String(editor.innerText || editor.textContent || '');
-  }}
+  }
   const sendFound = findSendButton();
-  const sendButton = sendFound ? {{
+  const sendButton = sendFound ? {
     found: true,
     visible: sendFound.visible,
     disabled: Boolean(sendFound.btn.disabled),
     aria_disabled: String(sendFound.btn.getAttribute('aria-disabled') || '').toLowerCase() === 'true',
     label: sendFound.label.slice(0, 120)
-  }} : {{found: false, visible: false, disabled: true, aria_disabled: true, label: ''}};
-  const headerEl = document.querySelector('header, nav, [data-testid*="project"], [aria-label*="project" i]');
-  const modelEl = document.querySelector('[data-testid*="model"], [aria-label*="model" i], button[aria-haspopup="listbox"]');
-  const alertTexts = Array.from(document.querySelectorAll('[role="alert"], .error, [data-testid*="error"]'))
+  } : {found: false, visible: false, disabled: true, aria_disabled: true, label: ''};
+  const modelEl = document.querySelector('button[data-testid="model-selector-trigger"], button[aria-label^="Select model"]');
+  const modelButton = modelEl ? {
+    found: true,
+    text: String(modelEl.innerText || modelEl.textContent || '').trim().slice(0, 200),
+    aria_label: String(modelEl.getAttribute('aria-label') || '').trim().slice(0, 200)
+  } : {found: false, text: '', aria_label: ''};
+  const projectEl = document.querySelector('button[aria-label^="Select project, current:"]');
+  const projectButton = projectEl ? {
+    found: true,
+    text: String(projectEl.innerText || projectEl.textContent || '').trim().slice(0, 200),
+    aria_label: String(projectEl.getAttribute('aria-label') || '').trim().slice(0, 240)
+  } : {found: false, text: '', aria_label: ''};
+  const isInsideUserOrEditor = (n) => Boolean(n && n.closest && n.closest('[data-testid="user-message"], [data-testid="user-message-content"], [contenteditable="true"], textarea'));
+  const alertTexts = Array.from(document.querySelectorAll('[role="alert"], [data-testid*="error-banner"], [data-testid="error-message"], .error-banner'))
+    .filter(n => !isInsideUserOrEditor(n))
     .map(n => String(n.innerText || n.textContent || '').trim())
     .filter(Boolean)
     .slice(0, 5);
-  const bodyClone = document.body ? document.body.cloneNode(true) : null;
-  if (bodyClone) {{
-    bodyClone.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]').forEach(n => n.remove());
-  }}
-  const conversationText = bodyClone ? String(bodyClone.innerText || bodyClone.textContent || '') : '';
-  return JSON.stringify({{
+  const dialogTexts = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]'))
+    .filter(n => !isInsideUserOrEditor(n))
+    .map(n => String(n.innerText || n.textContent || '').trim().slice(0, 500))
+    .filter(Boolean)
+    .slice(0, 3);
+  const userNodes = Array.from(document.querySelectorAll('[data-testid="user-message-content"], [data-testid="user-message"]'));
+  const markerInConv = Boolean(marker && userNodes.some(n => String(n.innerText || n.textContent || '').includes(marker)));
+  return JSON.stringify({
     url: window.location.href,
     title: document.title || '',
     editor_found: Boolean(editor),
     draft_text: draftText,
     send_button: sendButton,
-    project_text: headerEl ? String(headerEl.innerText || headerEl.textContent || '').slice(0, 400) : '',
-    model_text: modelEl ? String(modelEl.innerText || modelEl.textContent || '').slice(0, 200) : '',
+    model_button: modelButton,
+    project_button: projectButton,
     error_banners: alertTexts,
-    marker_in_conversation: Boolean(marker && conversationText.includes(marker)),
-    visible_text: conversationText.slice(0, 4000)
-  }});
-}})()"""
-    )
+    dialog_texts: dialogTexts,
+    marker_in_conversation: markerInConv
+  });
+})();"""
+    return "return (() => {" + JS_FIND_EDITOR_SNIPPET + JS_FIND_SEND_SNIPPET + body.replace("__MARKER__", encoded_marker)
 
 
 JS_CLICK_SEND = (
-    "(() => {"
+    "return (() => {"
     + JS_FIND_SEND_SNIPPET
-    + """
+    + r"""
   const sendFound = findSendButton();
   if (!sendFound) return JSON.stringify({clicked: false, reason: 'send_button_not_found'});
   const btn = sendFound.btn;
@@ -1137,52 +1285,77 @@ JS_CLICK_SEND = (
   }
   btn.click();
   return JSON.stringify({clicked: true, url: window.location.href});
-})()"""
+})();"""
 )
 
 
 def build_status_inspect_js(task_marker: str) -> str:
     encoded_marker = json.dumps(task_marker)
-    return (
-        "(() => {"
-        + f"""
-  const marker = {encoded_marker};
-  const stopBtn = Array.from(document.querySelectorAll('button, [role="button"]')).find(b => {{
-    const txt = ((b.getAttribute('aria-label') || '') + ' ' + (b.innerText || b.textContent || '')).trim();
-    const r = b.getBoundingClientRect();
-    return r.width > 0 && r.height > 0 && /\b(?:stop|cancel)\b/i.test(txt);
-  }});
-  const busyNode = document.querySelector('[aria-busy="true"], [data-status="running"], [data-state="running"]');
-  const errorBanners = Array.from(document.querySelectorAll('[role="alert"], [data-testid*="error"], .error-banner'))
-    .map(n => String(n.innerText || n.textContent || '').trim())
+    body = r"""return (() => {
+  const marker = __MARKER__;
+  const isVisible = (el) => {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const s = window.getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+  };
+  const cancelBtn = Array.from(document.querySelectorAll('button[aria-label="Cancel (Ctrl+D)"]')).find(isVisible) || null;
+  const isInsideUserOrEditor = (n) => Boolean(n && n.closest && n.closest('[data-testid="user-message"], [data-testid="user-message-content"], [contenteditable="true"], textarea'));
+  const errorBanners = Array.from(document.querySelectorAll('[role="alert"], [data-testid*="error-banner"], [data-testid="error-message"], .error-banner'))
+    .filter(n => !isInsideUserOrEditor(n) && isVisible(n))
+    .map(n => String(n.innerText || n.textContent || '').trim().slice(0, 500))
     .filter(Boolean)
     .slice(0, 5);
-  const assistantNodes = Array.from(document.querySelectorAll('[data-role="assistant"], [data-message-author="assistant"], [data-message-author="model"], .assistant-message'));
-  const userNodes = Array.from(document.querySelectorAll('[data-role="user"], [data-message-author="user"], .user-message'));
-  const assistantMessages = assistantNodes.map(n => String(n.innerText || n.textContent || '').trim()).filter(Boolean).slice(-5).map(s => s.slice(0, 1000));
-  const userMessages = userNodes.map(n => String(n.innerText || n.textContent || '').trim()).filter(Boolean).slice(-5).map(s => s.slice(0, 1000));
-  const bodyClone = document.body ? document.body.cloneNode(true) : null;
-  if (bodyClone) {{
-    bodyClone.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]').forEach(n => n.remove());
-  }}
-  const nonEditorText = bodyClone ? String(bodyClone.innerText || bodyClone.textContent || '') : '';
-  return JSON.stringify({{
+  const dialogTexts = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]'))
+    .filter(n => !isInsideUserOrEditor(n) && isVisible(n))
+    .map(n => String(n.innerText || n.textContent || '').trim().slice(0, 500))
+    .filter(Boolean)
+    .slice(0, 3);
+  const turnNodes = Array.from(document.querySelectorAll('[data-testid="user-message"], [data-testid="agent-response"]'));
+  const turns = [];
+  for (const node of turnNodes) {
+    const tid = node.getAttribute('data-testid');
+    if (tid === 'user-message') {
+      const contentNode = node.querySelector('[data-testid="user-message-content"]') || node;
+      const txt = String(contentNode.innerText || contentNode.textContent || '').trim();
+      if (txt) turns.push({role: 'user', text: txt.slice(0, 2000)});
+    } else if (tid === 'agent-response') {
+      const txt = String(node.innerText || node.textContent || '').trim();
+      if (txt) turns.push({role: 'assistant', text: txt.slice(0, 2000)});
+    }
+  }
+  let markerUserIndex = -1;
+  if (marker) {
+    for (let i = 0; i < turns.length; i++) {
+      if (turns[i].role === 'user' && turns[i].text.includes(marker)) {
+        markerUserIndex = i;
+      }
+    }
+  }
+  const userMessages = turns.filter(t => t.role === 'user').map(t => t.text).slice(-5);
+  const assistantMessages = turns.filter(t => t.role === 'assistant').map(t => t.text).slice(-5);
+  const assistantAfterMarker = marker
+    ? (markerUserIndex >= 0 ? turns.slice(markerUserIndex + 1).filter(t => t.role === 'assistant').map(t => t.text).slice(-5) : [])
+    : assistantMessages;
+  return JSON.stringify({
     url: window.location.href,
     title: document.title || '',
-    running: Boolean(stopBtn || busyNode),
-    has_stop_button: Boolean(stopBtn),
+    running: Boolean(cancelBtn),
+    has_stop_button: Boolean(cancelBtn),
     error_banners: errorBanners,
-    assistant_messages: assistantMessages,
+    dialog_texts: dialogTexts,
+    turns: turns.slice(-20),
     user_messages: userMessages,
-    marker_in_conversation: Boolean(marker && nonEditorText.includes(marker)),
-    visible_text: nonEditorText.slice(-4000)
-  }});
-}})()"""
-    )
+    assistant_messages: assistantMessages,
+    assistant_after_marker: assistantAfterMarker,
+    marker_in_conversation: Boolean(marker && markerUserIndex >= 0)
+  });
+})();"""
+    return body.replace("__MARKER__", encoded_marker)
 
 
 class BrowserUseClient:
-    """Bounded subprocess wrapper around `minis-browser-use` (official DOM actions only)."""
+    """Bounded subprocess wrapper around real `minis-browser-use` CLI commands."""
 
     def __init__(
         self,
@@ -1214,28 +1387,34 @@ class BrowserUseClient:
         return parse_browser_envelope(proc.stdout)
 
     def list_tabs(self) -> List[Dict[str, str]]:
-        env = self._run(["tabs"])
+        env = self._run(["list_tabs"])
         return parse_tabs_from_envelope(env)
 
     def open_url(self, url: str) -> Optional[str]:
         safe_url = validate_official_url(url, "open URL")
-        env = self._run(["open", safe_url])
-        parsed = env.get("parsed")
-        if isinstance(parsed, dict):
-            tid = parsed.get("tab_id") or parsed.get("tabId") or parsed.get("id")
-            if tid is not None:
-                return str(tid)
+        env = self._run(["new_tab", "--url", safe_url])
         tabs = parse_tabs_from_envelope(env)
         if tabs:
-            return tabs[0]["tab_id"]
+            return validate_tab_id(tabs[0]["tab_id"])
+        if env.get("tab_id") is not None:
+            return validate_tab_id(env["tab_id"])
+        parsed = env.get("parsed")
+        if isinstance(parsed, dict):
+            tid = parsed.get("tab_id") if parsed.get("tab_id") is not None else parsed.get("tabId")
+            if tid is None:
+                tid = parsed.get("id")
+            if tid is not None:
+                return validate_tab_id(tid)
         return None
 
     def navigate(self, tab_id: str, url: str) -> Dict[str, Any]:
+        safe_tid = validate_tab_id(tab_id)
         safe_url = validate_official_url(url, "navigate URL")
-        return self._run(["navigate", "--tab-id", tab_id, safe_url])
+        return self._run(["navigate", "--tab-id", safe_tid, "--url", safe_url])
 
     def eval_js(self, tab_id: str, js_code: str) -> Dict[str, Any]:
-        return self._run(["eval", "--tab-id", tab_id, js_code])
+        safe_tid = validate_tab_id(tab_id)
+        return self._run(["execute_js", "--tab-id", safe_tid, "--script", js_code])
 
     def resolve_official_tab(
         self,
@@ -1246,10 +1425,11 @@ class BrowserUseClient:
     ) -> str:
         """Discover a matching official tab or open it normally; never persisted."""
         safe_target = validate_official_url(target_url, "target URL")
-        if tab_id_override:
+        if tab_id_override is not None:
+            safe_tid = validate_tab_id(tab_id_override)
             if navigate_to_target:
-                self.navigate(tab_id_override, safe_target)
-            return tab_id_override
+                self.navigate(safe_tid, safe_target)
+            return safe_tid
 
         tabs = self.list_tabs()
         official_tabs = []
@@ -1261,7 +1441,10 @@ class BrowserUseClient:
                 continue
 
         exact_match = next((t for t in official_tabs if t["url"] == safe_target), None)
-        project_match = next((t for t in official_tabs if OFFICIAL_PROJECT_ID in t["url"]), None)
+        project_match = next(
+            (t for t in official_tabs if extract_url_project_id(t["url"]) == OFFICIAL_PROJECT_ID),
+            None,
+        )
         chosen = exact_match or project_match or (official_tabs[0] if official_tabs else None)
 
         if chosen is not None:
@@ -1273,7 +1456,6 @@ class BrowserUseClient:
         if opened_id:
             return opened_id
 
-        # Re-list tabs once after normal open to discover the newly opened official tab
         refreshed = self.list_tabs()
         for tab in refreshed:
             try:
@@ -1284,14 +1466,18 @@ class BrowserUseClient:
         raise BrowserError("official_tab_not_found", "Could not discover or open an official Antigravity tab.")
 
 
-def detect_blocking_reason(url: str, visible_text: str, error_banners: Sequence[str]) -> Optional[str]:
-    """Detect identity/quota/permission/error blockers from URL and visible UI text."""
+def detect_blocking_reason(
+    url: str,
+    scoped_texts: Sequence[str],
+    error_banners: Sequence[str],
+) -> Optional[str]:
+    """Detect identity/quota/permission/error blockers from URL, banners, and scoped non-user text."""
     try:
         validate_official_url(url, "current URL")
     except ValidationError:
         return "identity_or_non_official_url"
 
-    combined = "\n".join(list(error_banners) + [visible_text or ""])
+    combined = "\n".join(list(error_banners) + [t for t in scoped_texts if t])
     if any(p.search(combined) for p in AUTH_BLOCK_PATTERNS):
         return "identity_or_verification"
     if any(p.search(combined) for p in QUOTA_BLOCK_PATTERNS):
@@ -1305,6 +1491,54 @@ def detect_blocking_reason(url: str, visible_text: str, error_banners: Sequence[
     return None
 
 
+def _select_relevant_assistant_messages(
+    parsed: Dict[str, Any],
+    task_marker: Optional[str],
+) -> Tuple[bool, List[str], List[str]]:
+    """Extract (marker_in_conversation, user_messages, assistant_messages_after_marker)."""
+    turns = parsed.get("turns")
+    if isinstance(turns, list) and turns:
+        user_messages = [
+            str(t.get("text") or "").strip()
+            for t in turns
+            if isinstance(t, dict) and t.get("role") == "user" and str(t.get("text") or "").strip()
+        ]
+        if task_marker:
+            marker_idx = -1
+            for idx, item in enumerate(turns):
+                if isinstance(item, dict) and item.get("role") == "user" and task_marker in str(item.get("text") or ""):
+                    marker_idx = idx
+            if marker_idx < 0:
+                return False, user_messages, []
+            after = [
+                str(t.get("text") or "").strip()
+                for t in turns[marker_idx + 1 :]
+                if isinstance(t, dict) and t.get("role") == "assistant" and str(t.get("text") or "").strip()
+            ]
+            return True, user_messages, after
+        all_assistant = [
+            str(t.get("text") or "").strip()
+            for t in turns
+            if isinstance(t, dict) and t.get("role") == "assistant" and str(t.get("text") or "").strip()
+        ]
+        return bool(parsed.get("marker_in_conversation")), user_messages, all_assistant
+
+    user_messages = [str(x).strip() for x in (parsed.get("user_messages") or []) if str(x).strip()]
+    marker_in_conv = bool(parsed.get("marker_in_conversation")) or (
+        bool(task_marker) and any(task_marker in u for u in user_messages)
+    )
+    if "assistant_after_marker" in parsed and isinstance(parsed.get("assistant_after_marker"), list):
+        after = [str(x).strip() for x in parsed["assistant_after_marker"] if str(x).strip()]
+        if task_marker and not marker_in_conv:
+            return False, user_messages, []
+        return marker_in_conv, user_messages, after
+
+    assistant_messages = [str(x).strip() for x in (parsed.get("assistant_messages") or []) if str(x).strip()]
+    if task_marker and not marker_in_conv:
+        return False, user_messages, []
+    return marker_in_conv, user_messages, assistant_messages
+
+
 def classify_ui_status(
     ui_envelope: Dict[str, Any],
     *,
@@ -1314,44 +1548,57 @@ def classify_ui_status(
     """Classify official UI state into running, blocked, or returned (never accepted)."""
     parsed = ui_envelope.get("parsed")
     human_text = ui_envelope.get("human_text")
+    env_page_url = ui_envelope.get("page_url") if isinstance(ui_envelope.get("page_url"), str) else None
 
-    if isinstance(parsed, dict) and ("url" in parsed or "running" in parsed or "visible_text" in parsed or "error" in parsed):
-        url = str(parsed.get("url") or fallback_url or "")
+    if ui_envelope.get("parsed_is_null") is True:
+        return {
+            "classification": "blocked",
+            "reason": "null_js_return",
+            "url": sanitize_text(env_page_url or fallback_url or "", max_len=300),
+            "running": False,
+            "marker_in_conversation": False,
+            "accepted": False,
+            "evidence": "execute_js returned null (missing explicit return or empty page state).",
+        }
+
+    structured_keys = ("url", "page_url", "running", "turns", "assistant_messages", "assistant_after_marker", "error_banners", "error")
+    if isinstance(parsed, dict) and any(k in parsed for k in structured_keys):
+        url = str(parsed.get("url") or parsed.get("page_url") or env_page_url or fallback_url or "")
         running = bool(parsed.get("running") or parsed.get("has_stop_button"))
-        error_banners = [str(x) for x in (parsed.get("error_banners") or []) if str(x).strip()]
+        error_banners = [str(x).strip() for x in (parsed.get("error_banners") or []) if str(x).strip()]
         if parsed.get("error"):
             error_banners.append(sanitize_text(parsed.get("error"), max_len=240))
         if parsed.get("has_error") is True and not error_banners:
             error_banners.append("UI reported has_error=true")
-        assistant_messages = [str(x) for x in (parsed.get("assistant_messages") or []) if str(x).strip()]
-        user_messages = [str(x) for x in (parsed.get("user_messages") or []) if str(x).strip()]
-        visible_text = str(parsed.get("visible_text") or human_text or "")
-        marker_in_conv = bool(parsed.get("marker_in_conversation")) or (
-            bool(task_marker) and task_marker in visible_text
-        )
+        dialog_texts = [str(x).strip() for x in (parsed.get("dialog_texts") or []) if str(x).strip()]
+        marker_in_conv, user_messages, relevant_assistant = _select_relevant_assistant_messages(parsed, task_marker)
+        # Never scan user_messages or full page body containing user task goals for blocking keywords!
+        scoped_texts = dialog_texts + relevant_assistant
+        evidence_fallback = "; ".join(error_banners or dialog_texts or relevant_assistant[-1:]) or "No assistant response yet."
     elif isinstance(human_text, str) and human_text.strip():
         url_match = OFFICIAL_URL_IN_TEXT_RE.search(human_text)
-        url = url_match.group(0) if url_match else (fallback_url or "")
-        running = bool(re.search(r"(?i)\b(?:running\s*[:=]\s*true|generating|stop\s+generating|in\s+progress)\b", human_text))
+        url = url_match.group(0) if url_match else (env_page_url or fallback_url or "")
+        running = bool(re.search(r"(?i)\b(?:running\s*[:=]\s*true|generating|cancel\s*\(ctrl\+d\)|in\s+progress)\b", human_text))
         error_banners = []
         if re.search(r"(?i)\b(?:error\s*:|failed\s*:|exception\s*:|status\s*[:=]\s*(?:error|blocked|failed))\b", human_text):
             error_banners.append(sanitize_text(human_text, max_len=240))
-        assistant_messages = []
         user_messages = []
-        visible_text = human_text
+        relevant_assistant = []
+        scoped_texts = [human_text]
         marker_in_conv = bool(task_marker) and task_marker in human_text
+        evidence_fallback = human_text
     else:
         return {
             "classification": "blocked",
             "reason": "malformed_ui_state",
-            "url": sanitize_text(fallback_url or "", max_len=300),
+            "url": sanitize_text(env_page_url or fallback_url or "", max_len=300),
             "running": False,
             "marker_in_conversation": False,
             "accepted": False,
             "evidence": "UI parser received empty or unrecognized payload.",
         }
 
-    blocker = detect_blocking_reason(url, visible_text, error_banners)
+    blocker = detect_blocking_reason(url, scoped_texts, error_banners)
     if blocker in ("identity_or_non_official_url", "identity_or_verification", "quota_or_billing", "permission"):
         return {
             "classification": "blocked",
@@ -1360,7 +1607,7 @@ def classify_ui_status(
             "running": running,
             "marker_in_conversation": marker_in_conv,
             "accepted": False,
-            "evidence": sanitize_text("; ".join(error_banners) or visible_text, max_len=500),
+            "evidence": sanitize_text("; ".join(error_banners) or evidence_fallback, max_len=500),
         }
 
     if not running and blocker is not None:
@@ -1371,7 +1618,7 @@ def classify_ui_status(
             "running": False,
             "marker_in_conversation": marker_in_conv,
             "accepted": False,
-            "evidence": sanitize_text("; ".join(error_banners) or visible_text, max_len=500),
+            "evidence": sanitize_text("; ".join(error_banners) or evidence_fallback, max_len=500),
         }
 
     if running:
@@ -1382,14 +1629,14 @@ def classify_ui_status(
             "running": True,
             "marker_in_conversation": marker_in_conv,
             "accepted": False,
-            "evidence": sanitize_text(visible_text, max_len=400),
+            "evidence": sanitize_text(evidence_fallback, max_len=400),
         }
 
-    # Not running and no error banners: require genuine assistant response distinct from prompt echo
+    # Not running and no error banners: require genuine assistant response AFTER task_marker distinct from prompt echo
     user_norm = {u.strip() for u in user_messages if u.strip()}
     distinct_assistant = [
         msg
-        for msg in assistant_messages
+        for msg in relevant_assistant
         if msg.strip() not in user_norm
         and (not task_marker or not msg.strip().startswith(f"[{task_marker}]"))
     ]
@@ -1411,7 +1658,7 @@ def classify_ui_status(
         "running": False,
         "marker_in_conversation": marker_in_conv,
         "accepted": False,
-        "evidence": sanitize_text(visible_text, max_len=400),
+        "evidence": sanitize_text(evidence_fallback, max_len=400),
     }
 
 
@@ -1494,37 +1741,64 @@ def _verify_pre_send_ui(
     expected_project: str,
     expected_model: str,
 ) -> Dict[str, Any]:
+    if inspect_env.get("parsed_is_null") is True:
+        raise BrowserError("null_js_return", "Pre-send UI inspection returned null.")
     parsed = inspect_env.get("parsed")
     if not isinstance(parsed, dict):
         raise BrowserError("malformed_draft_inspection", "Pre-send UI inspection did not return structured state.")
 
-    url = str(parsed.get("url") or "")
+    url = str(parsed.get("url") or parsed.get("page_url") or inspect_env.get("page_url") or "")
     validate_official_url(url, "pre-send page URL")
 
-    visible_text = str(parsed.get("visible_text") or "")
-    error_banners = [str(x) for x in (parsed.get("error_banners") or []) if str(x).strip()]
-    blocker = detect_blocking_reason(url, visible_text, error_banners)
+    error_banners = [str(x).strip() for x in (parsed.get("error_banners") or []) if str(x).strip()]
+    dialog_texts = [str(x).strip() for x in (parsed.get("dialog_texts") or []) if str(x).strip()]
+    blocker = detect_blocking_reason(url, dialog_texts, error_banners)
     if blocker is not None:
         raise BrowserError("ui_blocked", f"Official UI is blocked before send ({blocker}).")
 
     if not parsed.get("editor_found"):
         raise BrowserError("editor_not_found", "Prompt editor not found during pre-send verification.")
 
-    project_haystack = " ".join(
-        [url, str(parsed.get("title") or ""), str(parsed.get("project_text") or ""), visible_text[:1000]]
-    )
-    if expected_project and expected_project.lower() not in project_haystack.lower():
-        raise BrowserError(
-            "unexpected_project",
-            f"Expected project '{expected_project}' not verified in official UI/URL.",
-        )
+    # Project verification strictly from URL ?project= query param OR official project selector button (never body/prompt text)
+    if expected_project:
+        url_project = extract_url_project_id(url)
+        proj_btn = parsed.get("project_button") if isinstance(parsed.get("project_button"), dict) else {}
+        proj_btn_found = bool(proj_btn.get("found"))
+        proj_btn_label = " ".join(
+            [str(proj_btn.get("aria_label") or ""), str(proj_btn.get("text") or "")]
+        ).strip()
+        expected_low = expected_project.strip().lower()
+        is_uuid_expected = bool(re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", expected_low))
+        if is_uuid_expected:
+            if url_project is None or url_project.lower() != expected_low:
+                raise BrowserError(
+                    "unexpected_project",
+                    f"Expected project query ID '{expected_project}' not verified in official URL.",
+                )
+        else:
+            matched_query = url_project is not None and url_project.lower() == expected_low
+            matched_btn = proj_btn_found and expected_low in proj_btn_label.lower()
+            if not (matched_query or matched_btn):
+                raise BrowserError(
+                    "unexpected_project",
+                    f"Expected project '{expected_project}' not verified in URL query or official project selector.",
+                )
 
-    model_haystack = " ".join([str(parsed.get("model_text") or ""), visible_text[:1000]])
-    if expected_model and expected_model.lower() not in model_haystack.lower():
-        raise BrowserError(
-            "unexpected_model",
-            f"Expected model '{expected_model}' not verified in official UI.",
-        )
+    # Model verification strictly from official model selector button (never body/prompt text)
+    if expected_model:
+        model_btn = parsed.get("model_button")
+        if not isinstance(model_btn, dict) or not model_btn.get("found"):
+            raise BrowserError(
+                "model_selector_not_found",
+                "Official model selector button not found; refusing to verify model from page text.",
+            )
+        actual_model = " ".join(str(model_btn.get("text") or "").split())
+        expected_model_norm = " ".join(expected_model.split())
+        if actual_model.lower() != expected_model_norm.lower():
+            raise BrowserError(
+                "unexpected_model",
+                f"Expected model '{expected_model_norm}', but model selector button shows '{actual_model}'.",
+            )
 
     actual_draft = normalize_newlines(str(parsed.get("draft_text") or ""))
     expected_norm = normalize_newlines(expected_prompt)
@@ -1572,6 +1846,8 @@ def cmd_submit(
     validated = load_and_validate_contract(args.contract)
     project_url = validate_official_url(args.project_url, "project URL")
     timeout = validate_timeout(args.timeout)
+    if args.tab_id is not None:
+        validate_tab_id(args.tab_id)
     journal = JobJournal(args.state_dir)
     prompt_text = build_gemini_prompt(validated)
 
@@ -1824,7 +2100,8 @@ def cmd_submit(
     attempt_entry["send_initiated"] = True
     attempt_entry["send_initiated_at"] = utc_now_iso()
     attempt_entry["prompt_sha256"] = sha256_text(prompt_text)
-    attempt_entry["conversation_url"] = validate_official_url(str(inspected["url"]))
+    pre_send_url = str(inspected.get("url") or inspected.get("page_url") or inspect_env.get("page_url") or project_url)
+    attempt_entry["conversation_url"] = validate_official_url(pre_send_url)
     journal.save(task_id, job)
 
     # Step 4: Click non-disabled send button
@@ -1869,7 +2146,12 @@ def cmd_submit(
         raise BrowserError("send_not_clicked", f"Send button was not clicked ({reason}).")
 
     # Step 5: Bounded post-send read-only confirmation
-    post_url = str(click_parsed.get("url") or attempt_entry["conversation_url"])
+    post_url = str(
+        click_parsed.get("url")
+        or click_parsed.get("page_url")
+        or click_env.get("page_url")
+        or attempt_entry["conversation_url"]
+    )
     try:
         post_env = browser.eval_js(tab_id, build_status_inspect_js(task_marker))
         post_status = classify_ui_status(post_env, task_marker=task_marker, fallback_url=post_url)
@@ -2199,11 +2481,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_sub = sub.add_parser("submit", help="Sync GitHub job branch/snapshot and submit prompt via official UI.")
     p_sub.add_argument("--contract", required=True, help="Path to task contract JSON file.")
     p_sub.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help="Local job journal directory.")
-    p_sub.add_argument("--tab-id", default=None, help="Ephemeral browser tab ID override (never persisted).")
+    p_sub.add_argument("--tab-id", default=None, help="Ephemeral numeric browser tab ID override (never persisted).")
     p_sub.add_argument("--dry-run", action="store_true", help="Preview actions and prompt without mutating GitHub or sending.")
-    p_sub.add_argument("--project-url", default=DEFAULT_PROJECT_URL, help="Official Antigravity project URL.")
-    p_sub.add_argument("--expected-project", default=OFFICIAL_PROJECT_ID, help="Expected project ID or label verified before send.")
-    p_sub.add_argument("--expected-model", default=DEFAULT_EXPECTED_MODEL, help="Expected included Pro model verified before send.")
+    p_sub.add_argument("--project-url", default=DEFAULT_PROJECT_URL, help="Official Antigravity project URL (?project=<id>).")
+    p_sub.add_argument("--expected-project", default=OFFICIAL_PROJECT_ID, help="Expected project query ID or selector label verified before send.")
+    p_sub.add_argument("--expected-model", default=DEFAULT_EXPECTED_MODEL, help="Expected exact model button text verified before send (default: Gemini 4 Neon High).")
     p_sub.add_argument("--browser-bin", default=DEFAULT_BROWSER_BIN, help="Browser CLI executable.")
     p_sub.add_argument("--mcp-bin", default=DEFAULT_MCP_BIN, help="MCP CLI executable.")
     p_sub.add_argument("--mcp-server", default=DEFAULT_MCP_SERVER, help="MCP server name.")
@@ -2214,7 +2496,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_st.add_argument("--task-id", default=None, help="Task identifier (if --contract is omitted).")
     p_st.add_argument("--attempt", type=int, default=None, help="Attempt number (defaults to latest recorded).")
     p_st.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help="Local job journal directory.")
-    p_st.add_argument("--tab-id", default=None, help="Ephemeral browser tab ID override (never persisted).")
+    p_st.add_argument("--tab-id", default=None, help="Ephemeral numeric browser tab ID override (never persisted).")
     p_st.add_argument("--conversation-url", default=None, help="Official conversation URL override.")
     p_st.add_argument("--browser-bin", default=DEFAULT_BROWSER_BIN, help="Browser CLI executable.")
     p_st.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS, help="Per-command timeout in seconds (1..120).")

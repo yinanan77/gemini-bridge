@@ -4,15 +4,15 @@
 
 ## 重要说明与边界限制
 
-- **调用方式**：通过官方 Antigravity 网页端 UI（`https://antigravity.google.com/remote`，项目 `561adc82-06e6-4c8c-862f-3ac493b947c1`）与现有 Google Pro 登录态协作。
+- **调用方式**：通过官方 Antigravity 网页端 UI（`https://antigravity.google.com/remote?project=561adc82-06e6-4c8c-862f-3ac493b947c1`）与现有 Google Pro 登录态协作。
 - **明确不宣称**：
   - 不是原生模型 Provider/API 集成；
   - 不提供自动 GitHub Issue 触发；
   - 不保证 iOS App 后台/挂起期间持续运行；
   - 不宣称零成本（消耗现有 Pro 订阅包含额度，不开启付费加购或账单变更；额度不可用即停并报告）。
-- **人工介入前提**：首次或偶发会话失效、账号风控、人机验证（CAPTCHA/2FA）时，需人工在官方页面完成验证；工具不会绕过验证、不会提取 Cookie/Token、不会解除禁用按钮、不会调用未公开接口。
+- **人工介入前提**：首次或偶发会话失效、账号风控、人机验证（如 `Verify your account to continue.` / CAPTCHA / 2FA）时，需人工在官方页面完成验证；工具不会绕过验证、不会提取 Cookie/Token、不会解除禁用按钮、不会调用未公开接口。
 - **有界单次执行**：`validate` / `submit` / `status` / `collect` 均执行有界动作后立即退出，内置**无轮询循环、无 `sleep`**；如需等待，由 GPT 在 Minis shell 层显式间隔后再次调用 `status`。
-- **绝不持久保存 `tab_id`**：本地日志只保存官方 `conversation_url`、各 `attempt` 状态、错误与哈希；每次调用动态发现官方标签页或按 `--tab-id` 临时指定。
+- **绝不持久保存 `tab_id`**：本地日志只保存官方 `conversation_url`、各 `attempt` 状态、错误与哈希；每次调用动态发现官方标签页或按 `--tab-id <数字ID>` 临时指定。
 
 ---
 
@@ -44,14 +44,14 @@ python3 bridge/minis_gemini_bridge.py submit \
   --state-dir .bridge-state
 ```
 
-如需临时指定当前官方标签页，可附加 `--tab-id <TAB_ID>`（仅本次生效，不写入日志）。
+如需临时指定当前官方标签页，可附加严格数字 `--tab-id <数字ID>`（如 `--tab-id 4`，仅本次生效，不写入日志）。
 
 `submit` 执行顺序：
 1. 仅在 `attempt=1` 时从 `base_branch` 创建隔离分支 `gpt-gemini/jobs/<task_id>`；写入不可变快照 `jobs/<task_id>/attempt-<NN>/task.json`（若远端已存在不同 `contract_sha256` 则直接失败，绝不覆盖）。
-2. 打开/导航官方项目页新建对话。
+2. 打开/导航官方项目页 `https://antigravity.google.com/remote?project=561adc82-06e6-4c8c-862f-3ac493b947c1` 新建对话。
 3. 浏览器调用 1：聚焦输入框并执行 `execCommand('selectAll')`。
 4. 浏览器调用 2：通过 `ClipboardEvent('paste')` + `DataTransfer('text/plain')` 粘贴完整提示词。
-5. 浏览器调用 3（独立只读检查）：校验完整草稿与预期提示词逐字一致、预期项目与 Pro 模型匹配、无阻塞提示且发送按钮非禁用。
+5. 浏览器调用 3（独立只读检查）：校验完整草稿与预期提示词逐字一致、URL 查询参数/项目选择器与模型按钮（默认 `Gemini 4 Neon High`，可用 `--expected-model` 覆盖）匹配、无阻塞提示且发送按钮非禁用。
 6. **点击发送前**先原子写入本地日志 `state=submit_uncertain`（防超时重发），随后点击未禁用发送按钮并做一次只读确认。
 
 ### 3. 有界检查状态（`status`）

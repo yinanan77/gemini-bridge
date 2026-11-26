@@ -15,6 +15,8 @@ import unittest
 from unittest import mock
 
 BRIDGE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = BRIDGE_DIR.parent
+FIXTURES_PATH = REPO_ROOT / "orchestration" / "bootstrap" / "protocol-fixtures.json"
 if str(BRIDGE_DIR) not in sys.path:
     sys.path.insert(0, str(BRIDGE_DIR))
 
@@ -24,11 +26,34 @@ import minis_gemini_bridge as bridge  # noqa: E402
 HEAD_SHA_1 = "a" * 40
 HEAD_SHA_2 = "b" * 40
 OFFICIAL_PROJECT_URL = bridge.DEFAULT_PROJECT_URL
-OFFICIAL_CONV_URL = f"{bridge.OFFICIAL_REMOTE_BASE}/conversations/conv-12345"
+OFFICIAL_CONV_URL = (
+    f"{bridge.OFFICIAL_REMOTE_BASE}/0fcc41eb-6ecc-4880-90bb-ea94674d8bbb"
+    f"?project={bridge.OFFICIAL_PROJECT_ID}"
+)
 
 
 def make_proc(stdout: str = "", stderr: str = "", returncode: int = 0) -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args=["mock"], returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def make_real_exec_js_proc(
+    payload: object,
+    *,
+    tab_id: int = 4,
+    page_url: str = OFFICIAL_PROJECT_URL,
+    success: bool = True,
+) -> subprocess.CompletedProcess:
+    text = f"{json.dumps(payload)}\n  tab_id: {tab_id}"
+    return make_proc(
+        stdout=json.dumps(
+            {
+                "action": "execute_js",
+                "data": {"page_url": page_url, "success": success, "text": text},
+                "ok": True,
+                "tool": "minis-browser-use",
+            }
+        )
+    )
 
 
 def sample_contract(**overrides):
@@ -385,52 +410,72 @@ class TestSubmitPasteOrderTimeoutAndIdempotency(unittest.TestCase):
 
             def browser_runner(argv, timeout):
                 cmd = argv[1]
-                if cmd == "tabs":
-                    browser_steps.append("tabs")
+                if cmd == "list_tabs":
+                    self.assertEqual(argv, ["minis-browser-use", "list_tabs"])
+                    browser_steps.append("list_tabs")
                     return make_proc(
-                        stdout=json.dumps({"ok": True, "data": {"tabs": [{"tab_id": "ephemeral-99", "url": OFFICIAL_PROJECT_URL}]}})
+                        stdout=json.dumps(
+                            {
+                                "action": "list_tabs",
+                                "data": {
+                                    "success": True,
+                                    "text": (
+                                        "Open tabs:\n"
+                                        "  Tab 2: CLI 故障排查 — https://antigravity.google/docs/cli/troubleshooting/\n"
+                                        f"  Tab 4: Google Antigravity — {OFFICIAL_PROJECT_URL} *"
+                                    ),
+                                },
+                                "ok": True,
+                                "tool": "minis-browser-use",
+                            }
+                        )
                     )
                 if cmd == "navigate":
+                    self.assertEqual(argv, ["minis-browser-use", "navigate", "--tab-id", "4", "--url", OFFICIAL_PROJECT_URL])
                     browser_steps.append("navigate")
-                    return make_proc(stdout=json.dumps({"ok": True, "data": {"url": argv[-1]}}))
-                if cmd == "eval":
-                    js = argv[-1]
+                    return make_proc(
+                        stdout=json.dumps({"ok": True, "data": {"success": True, "page_url": OFFICIAL_PROJECT_URL}})
+                    )
+                if cmd == "execute_js":
+                    self.assertEqual(argv[:4], ["minis-browser-use", "execute_js", "--tab-id", "4"])
+                    self.assertEqual(argv[4], "--script")
+                    js = argv[5]
+                    self.assertTrue(js.startswith("return "))
                     if "execCommand('selectAll'" in js:
                         browser_steps.append("focus_selectAll")
-                        return make_proc(stdout=json.dumps({"ok": True, "data": {"text": json.dumps({"ok": True, "found": True})}}))
+                        return make_real_exec_js_proc({"ok": True, "found": True})
                     if "new ClipboardEvent('paste'" in js:
                         browser_steps.append("paste_event")
-                        return make_proc(stdout=json.dumps({"ok": True, "data": {"text": json.dumps({"ok": True, "dispatched": True})}}))
+                        return make_real_exec_js_proc({"ok": True, "dispatched": True})
                     if "draft_text: draftText" in js:
                         browser_steps.append("inspect_draft")
-                        return make_proc(
-                            stdout=json.dumps(
-                                {
-                                    "ok": True,
-                                    "data": {
-                                        "text": json.dumps(
-                                            {
-                                                "url": OFFICIAL_PROJECT_URL,
-                                                "title": "Antigravity",
-                                                "editor_found": True,
-                                                "draft_text": prompt,
-                                                "send_button": {
-                                                    "found": True,
-                                                    "visible": True,
-                                                    "disabled": False,
-                                                    "aria_disabled": False,
-                                                    "label": "Send",
-                                                },
-                                                "project_text": bridge.OFFICIAL_PROJECT_ID,
-                                                "model_text": "Gemini 3 Pro",
-                                                "error_banners": [],
-                                                "marker_in_conversation": False,
-                                                "visible_text": "Ready",
-                                            }
-                                        )
-                                    },
-                                }
-                            )
+                        return make_real_exec_js_proc(
+                            {
+                                "url": OFFICIAL_PROJECT_URL,
+                                "title": "Google Antigravity",
+                                "editor_found": True,
+                                "draft_text": prompt,
+                                "send_button": {
+                                    "found": True,
+                                    "visible": True,
+                                    "disabled": False,
+                                    "aria_disabled": False,
+                                    "label": "Send message",
+                                },
+                                "project_button": {
+                                    "found": True,
+                                    "text": "gemini-bridge",
+                                    "aria_label": "Select project, current: gemini-bridge",
+                                },
+                                "model_button": {
+                                    "found": True,
+                                    "text": "Gemini 4 Neon High",
+                                    "aria_label": "Select model",
+                                },
+                                "error_banners": [],
+                                "dialog_texts": [],
+                                "marker_in_conversation": False,
+                            }
                         )
                     if "btn.click()" in js:
                         browser_steps.append("click_send")
@@ -438,31 +483,23 @@ class TestSubmitPasteOrderTimeoutAndIdempotency(unittest.TestCase):
                         j = json.loads((state_dir / "jobs" / "calc-helper-v1.json").read_text(encoding="utf-8"))
                         self.assertEqual(j["attempts"]["1"]["state"], "submit_uncertain")
                         self.assertTrue(j["attempts"]["1"]["send_initiated"])
-                        return make_proc(
-                            stdout=json.dumps({"ok": True, "data": {"text": json.dumps({"clicked": True, "url": OFFICIAL_CONV_URL})}})
-                        )
+                        return make_real_exec_js_proc({"clicked": True, "url": OFFICIAL_CONV_URL}, page_url=OFFICIAL_CONV_URL)
                     if "has_stop_button" in js:
                         browser_steps.append("post_send_status")
-                        return make_proc(
-                            stdout=json.dumps(
-                                {
-                                    "ok": True,
-                                    "data": {
-                                        "text": json.dumps(
-                                            {
-                                                "url": OFFICIAL_CONV_URL,
-                                                "running": True,
-                                                "has_stop_button": True,
-                                                "error_banners": [],
-                                                "assistant_messages": [],
-                                                "user_messages": [prompt],
-                                                "marker_in_conversation": True,
-                                                "visible_text": f"[{validated['task_marker']}] running",
-                                            }
-                                        )
-                                    },
-                                }
-                            )
+                        return make_real_exec_js_proc(
+                            {
+                                "url": OFFICIAL_CONV_URL,
+                                "running": True,
+                                "has_stop_button": True,
+                                "error_banners": [],
+                                "dialog_texts": [],
+                                "turns": [{"role": "user", "text": prompt}],
+                                "user_messages": [prompt],
+                                "assistant_messages": [],
+                                "assistant_after_marker": [],
+                                "marker_in_conversation": True,
+                            },
+                            page_url=OFFICIAL_CONV_URL,
                         )
                 raise AssertionError(f"Unexpected browser call: {argv}")
 
@@ -476,13 +513,12 @@ class TestSubmitPasteOrderTimeoutAndIdempotency(unittest.TestCase):
             self.assertTrue(out1["sent"])
             self.assertEqual(
                 browser_steps,
-                ["tabs", "navigate", "focus_selectAll", "paste_event", "inspect_draft", "click_send", "post_send_status"],
+                ["list_tabs", "navigate", "focus_selectAll", "paste_event", "inspect_draft", "click_send", "post_send_status"],
             )
 
             # Verify journal NEVER stores tab_id
             journal_text = (state_dir / "jobs" / "calc-helper-v1.json").read_text(encoding="utf-8")
             self.assertNotIn("tab_id", journal_text)
-            self.assertNotIn("ephemeral-99", journal_text)
 
             # Second submit must be idempotent and NOT invoke browser click_send again
             browser_steps.clear()
@@ -506,41 +542,32 @@ class TestSubmitPasteOrderTimeoutAndIdempotency(unittest.TestCase):
             def browser_runner(argv, timeout):
                 cmd = argv[1]
                 if cmd == "navigate":
-                    return make_proc(stdout=json.dumps({"ok": True, "data": {"url": argv[-1]}}))
-                if cmd == "eval":
-                    js = argv[-1]
+                    return make_proc(stdout=json.dumps({"ok": True, "data": {"success": True, "page_url": argv[-1]}}))
+                if cmd == "execute_js":
+                    js = argv[5]
                     if "execCommand('selectAll'" in js:
-                        return make_proc(stdout=json.dumps({"ok": True, "data": {"text": json.dumps({"ok": True})}}))
+                        return make_real_exec_js_proc({"ok": True})
                     if "ClipboardEvent('paste'" in js:
-                        return make_proc(stdout=json.dumps({"ok": True, "data": {"text": json.dumps({"ok": True, "dispatched": True})}}))
+                        return make_real_exec_js_proc({"ok": True, "dispatched": True})
                     if "draft_text: draftText" in js:
-                        return make_proc(
-                            stdout=json.dumps(
-                                {
-                                    "ok": True,
-                                    "data": {
-                                        "text": json.dumps(
-                                            {
-                                                "url": OFFICIAL_PROJECT_URL,
-                                                "editor_found": True,
-                                                "draft_text": prompt,
-                                                "send_button": {"found": True, "visible": True, "disabled": True, "aria_disabled": False},
-                                                "project_text": bridge.OFFICIAL_PROJECT_ID,
-                                                "model_text": "Pro",
-                                                "error_banners": [],
-                                                "visible_text": "",
-                                            }
-                                        )
-                                    },
-                                }
-                            )
+                        return make_real_exec_js_proc(
+                            {
+                                "url": OFFICIAL_PROJECT_URL,
+                                "editor_found": True,
+                                "draft_text": prompt,
+                                "send_button": {"found": True, "visible": True, "disabled": True, "aria_disabled": False},
+                                "project_button": {"found": True, "text": "gemini-bridge", "aria_label": "Select project, current: gemini-bridge"},
+                                "model_button": {"found": True, "text": "Gemini 4 Neon High", "aria_label": "Select model"},
+                                "error_banners": [],
+                                "dialog_texts": [],
+                            }
                         )
                     if "btn.click()" in js:
                         clicked.append(True)
                 raise AssertionError(f"Unexpected call: {argv}")
 
             args = bridge.build_parser().parse_args(
-                ["submit", "--contract", str(cpath), "--state-dir", str(state_dir), "--tab-id", "tmp-tab-1"]
+                ["submit", "--contract", str(cpath), "--state-dir", str(state_dir), "--tab-id", "4"]
             )
             with self.assertRaises(bridge.BrowserError) as ctx:
                 bridge.cmd_submit(
@@ -569,34 +596,25 @@ class TestSubmitPasteOrderTimeoutAndIdempotency(unittest.TestCase):
                 nonlocal click_count
                 cmd = argv[1]
                 if cmd == "navigate":
-                    return make_proc(stdout=json.dumps({"ok": True, "data": {"url": argv[-1]}}))
-                if cmd == "eval":
-                    js = argv[-1]
+                    return make_proc(stdout=json.dumps({"ok": True, "data": {"success": True, "page_url": argv[-1]}}))
+                if cmd == "execute_js":
+                    js = argv[5]
                     if "execCommand('selectAll'" in js:
-                        return make_proc(stdout=json.dumps({"ok": True, "data": {"text": json.dumps({"ok": True})}}))
+                        return make_real_exec_js_proc({"ok": True})
                     if "ClipboardEvent('paste'" in js:
-                        return make_proc(stdout=json.dumps({"ok": True, "data": {"text": json.dumps({"ok": True, "dispatched": True})}}))
+                        return make_real_exec_js_proc({"ok": True, "dispatched": True})
                     if "draft_text: draftText" in js:
-                        return make_proc(
-                            stdout=json.dumps(
-                                {
-                                    "ok": True,
-                                    "data": {
-                                        "text": json.dumps(
-                                            {
-                                                "url": OFFICIAL_PROJECT_URL,
-                                                "editor_found": True,
-                                                "draft_text": prompt,
-                                                "send_button": {"found": True, "visible": True, "disabled": False, "aria_disabled": False},
-                                                "project_text": bridge.OFFICIAL_PROJECT_ID,
-                                                "model_text": "Gemini Pro",
-                                                "error_banners": [],
-                                                "visible_text": "",
-                                            }
-                                        )
-                                    },
-                                }
-                            )
+                        return make_real_exec_js_proc(
+                            {
+                                "url": OFFICIAL_PROJECT_URL,
+                                "editor_found": True,
+                                "draft_text": prompt,
+                                "send_button": {"found": True, "visible": True, "disabled": False, "aria_disabled": False},
+                                "project_button": {"found": True, "text": "gemini-bridge", "aria_label": "Select project, current: gemini-bridge"},
+                                "model_button": {"found": True, "text": "Gemini 4 Neon High", "aria_label": "Select model"},
+                                "error_banners": [],
+                                "dialog_texts": [],
+                            }
                         )
                     if "btn.click()" in js:
                         click_count += 1
@@ -604,7 +622,7 @@ class TestSubmitPasteOrderTimeoutAndIdempotency(unittest.TestCase):
                 raise AssertionError(f"Unexpected call: {argv}")
 
             args = bridge.build_parser().parse_args(
-                ["submit", "--contract", str(cpath), "--state-dir", str(state_dir), "--tab-id", "t-1"]
+                ["submit", "--contract", str(cpath), "--state-dir", str(state_dir), "--tab-id", "4"]
             )
             mcp = bridge.GitHubMcpClient(runner=gh.runner)
             code1, out1 = bridge.cmd_submit(
@@ -616,26 +634,19 @@ class TestSubmitPasteOrderTimeoutAndIdempotency(unittest.TestCase):
 
             # Second submit when marker is NOT yet visible: must refuse double send (exit 3)
             def not_visible_runner(argv, timeout):
-                if argv[1] == "eval" and "has_stop_button" in argv[-1]:
-                    return make_proc(
-                        stdout=json.dumps(
-                            {
-                                "ok": True,
-                                "data": {
-                                    "text": json.dumps(
-                                        {
-                                            "url": OFFICIAL_PROJECT_URL,
-                                            "running": False,
-                                            "error_banners": [],
-                                            "assistant_messages": [],
-                                            "user_messages": [],
-                                            "marker_in_conversation": False,
-                                            "visible_text": "Blank page",
-                                        }
-                                    )
-                                },
-                            }
-                        )
+                if argv[1] == "execute_js" and "has_stop_button" in argv[5]:
+                    return make_real_exec_js_proc(
+                        {
+                            "url": OFFICIAL_PROJECT_URL,
+                            "running": False,
+                            "error_banners": [],
+                            "dialog_texts": [],
+                            "turns": [],
+                            "user_messages": [],
+                            "assistant_messages": [],
+                            "assistant_after_marker": [],
+                            "marker_in_conversation": False,
+                        }
                     )
                 raise AssertionError(f"Must not paste/click on uncertain second submit: {argv}")
 
@@ -648,26 +659,20 @@ class TestSubmitPasteOrderTimeoutAndIdempotency(unittest.TestCase):
 
             # Third submit when task marker IS visible in official conversation: reconciles without sending
             def visible_runner(argv, timeout):
-                if argv[1] == "eval" and "has_stop_button" in argv[-1]:
-                    return make_proc(
-                        stdout=json.dumps(
-                            {
-                                "ok": True,
-                                "data": {
-                                    "text": json.dumps(
-                                        {
-                                            "url": OFFICIAL_CONV_URL,
-                                            "running": True,
-                                            "error_banners": [],
-                                            "assistant_messages": [],
-                                            "user_messages": [prompt],
-                                            "marker_in_conversation": True,
-                                            "visible_text": f"[{validated['task_marker']}] running",
-                                        }
-                                    )
-                                },
-                            }
-                        )
+                if argv[1] == "execute_js" and "has_stop_button" in argv[5]:
+                    return make_real_exec_js_proc(
+                        {
+                            "url": OFFICIAL_CONV_URL,
+                            "running": True,
+                            "error_banners": [],
+                            "dialog_texts": [],
+                            "turns": [{"role": "user", "text": prompt}],
+                            "user_messages": [prompt],
+                            "assistant_messages": [],
+                            "assistant_after_marker": [],
+                            "marker_in_conversation": True,
+                        },
+                        page_url=OFFICIAL_CONV_URL,
                     )
                 raise AssertionError(f"Must not click on reconcile: {argv}")
 
@@ -703,107 +708,94 @@ class TestSubmitPasteOrderTimeoutAndIdempotency(unittest.TestCase):
 
 class TestStatusClassification(unittest.TestCase):
     def test_running_false_plus_error_is_blocked_and_prompt_echo_is_not_success(self):
+        marker = "GPT-GEMINI-TASK:x:attempt-01:1234567890ab"
         env_err = bridge.parse_browser_envelope(
-            json.dumps(
+            make_real_exec_js_proc(
                 {
-                    "ok": True,
-                    "data": {
-                        "text": json.dumps(
-                            {
-                                "url": OFFICIAL_CONV_URL,
-                                "running": False,
-                                "error_banners": ["Something went wrong"],
-                                "assistant_messages": ["Partial output"],
-                                "user_messages": ["Prompt"],
-                                "marker_in_conversation": True,
-                                "visible_text": "Error",
-                            }
-                        )
-                    },
-                }
-            )
+                    "url": OFFICIAL_CONV_URL,
+                    "running": False,
+                    "error_banners": ["Something went wrong"],
+                    "dialog_texts": [],
+                    "turns": [
+                        {"role": "user", "text": f"[{marker}] Do task"},
+                        {"role": "assistant", "text": "Partial output"},
+                    ],
+                    "marker_in_conversation": True,
+                },
+                page_url=OFFICIAL_CONV_URL,
+            ).stdout
         )
-        res_err = bridge.classify_ui_status(env_err, task_marker="GPT-GEMINI-TASK:x:attempt-01:1234567890ab")
+        res_err = bridge.classify_ui_status(env_err, task_marker=marker)
         self.assertEqual(res_err["classification"], "blocked")
         self.assertFalse(res_err["accepted"])
 
         # Prompt echo / repeated prompt text with no genuine assistant response must NOT be classified as returned
-        echo = "[GPT-GEMINI-TASK:x:attempt-01:1234567890ab] status='completed'"
+        echo = f"[{marker}] status='completed'"
         env_echo = bridge.parse_browser_envelope(
-            json.dumps(
+            make_real_exec_js_proc(
                 {
-                    "ok": True,
-                    "data": {
-                        "text": json.dumps(
-                            {
-                                "url": OFFICIAL_CONV_URL,
-                                "running": False,
-                                "error_banners": [],
-                                "assistant_messages": [echo],
-                                "user_messages": [echo],
-                                "marker_in_conversation": True,
-                                "visible_text": echo,
-                            }
-                        )
-                    },
-                }
-            )
+                    "url": OFFICIAL_CONV_URL,
+                    "running": False,
+                    "error_banners": [],
+                    "dialog_texts": [],
+                    "turns": [
+                        {"role": "user", "text": echo},
+                        {"role": "assistant", "text": echo},
+                    ],
+                    "marker_in_conversation": True,
+                },
+                page_url=OFFICIAL_CONV_URL,
+            ).stdout
         )
-        res_echo = bridge.classify_ui_status(env_echo, task_marker="GPT-GEMINI-TASK:x:attempt-01:1234567890ab")
+        res_echo = bridge.classify_ui_status(env_echo, task_marker=marker)
         self.assertEqual(res_echo["classification"], "blocked")
         self.assertFalse(res_echo["accepted"])
 
-        # Quota / auth / permission blocks
+        # Quota / auth / permission blocks in assistant reply or dialog
         for text, expected_reason in [
+            ("Verify your account to continue.", "identity_or_verification"),
             ("Please verify you are human (CAPTCHA)", "identity_or_verification"),
             ("Pro subscription unavailable; add credits to continue", "quota_or_billing"),
             ("Permission denied accessing repository", "permission"),
         ]:
             env_b = bridge.parse_browser_envelope(
-                json.dumps(
+                make_real_exec_js_proc(
                     {
-                        "ok": True,
-                        "data": {
-                            "text": json.dumps(
-                                {
-                                    "url": OFFICIAL_CONV_URL,
-                                    "running": False,
-                                    "error_banners": [],
-                                    "assistant_messages": [],
-                                    "user_messages": [],
-                                    "visible_text": text,
-                                }
-                            )
-                        },
-                    }
-                )
+                        "url": OFFICIAL_CONV_URL,
+                        "running": False,
+                        "error_banners": [],
+                        "dialog_texts": [],
+                        "turns": [
+                            {"role": "user", "text": f"[{marker}] Do task"},
+                            {"role": "assistant", "text": text},
+                        ],
+                        "marker_in_conversation": True,
+                    },
+                    page_url=OFFICIAL_CONV_URL,
+                ).stdout
             )
-            out_b = bridge.classify_ui_status(env_b)
+            out_b = bridge.classify_ui_status(env_b, task_marker=marker)
             self.assertEqual(out_b["classification"], "blocked")
             self.assertEqual(out_b["reason"], expected_reason)
 
         # Genuine assistant reply classifies as returned, STILL accepted=False
         env_ret = bridge.parse_browser_envelope(
-            json.dumps(
+            make_real_exec_js_proc(
                 {
-                    "ok": True,
-                    "data": {
-                        "text": json.dumps(
-                            {
-                                "url": OFFICIAL_CONV_URL,
-                                "running": False,
-                                "error_banners": [],
-                                "assistant_messages": ["Pushed changes to gpt-gemini/jobs/x."],
-                                "user_messages": ["Prompt"],
-                                "marker_in_conversation": True,
-                                "visible_text": "Done",
-                            }
-                        )
-                    },
-                }
-            )
+                    "url": OFFICIAL_CONV_URL,
+                    "running": False,
+                    "error_banners": [],
+                    "dialog_texts": [],
+                    "turns": [
+                        {"role": "user", "text": f"[{marker}] Do task"},
+                        {"role": "assistant", "text": "Pushed changes to gpt-gemini/jobs/x."},
+                    ],
+                    "marker_in_conversation": True,
+                },
+                page_url=OFFICIAL_CONV_URL,
+            ).stdout
         )
-        res_ret = bridge.classify_ui_status(env_ret, task_marker="GPT-GEMINI-TASK:x:attempt-01:1234567890ab")
+        res_ret = bridge.classify_ui_status(env_ret, task_marker=marker)
         self.assertEqual(res_ret["classification"], "returned")
         self.assertFalse(res_ret["accepted"])
 
@@ -931,62 +923,44 @@ class TestCollectValidationInjectionAndRevisions(unittest.TestCase):
             def browser_ok(argv, timeout):
                 cmd = argv[1]
                 if cmd == "navigate":
-                    return make_proc(stdout=json.dumps({"ok": True, "data": {"url": argv[-1]}}))
-                if cmd == "eval":
-                    js = argv[-1]
+                    return make_proc(stdout=json.dumps({"ok": True, "data": {"success": True, "page_url": argv[-1]}}))
+                if cmd == "execute_js":
+                    js = argv[5]
                     if "execCommand('selectAll'" in js:
-                        return make_proc(stdout=json.dumps({"ok": True, "data": {"text": json.dumps({"ok": True})}}))
+                        return make_real_exec_js_proc({"ok": True})
                     if "ClipboardEvent('paste'" in js:
-                        return make_proc(stdout=json.dumps({"ok": True, "data": {"text": json.dumps({"ok": True, "dispatched": True})}}))
+                        return make_real_exec_js_proc({"ok": True, "dispatched": True})
                     if "draft_text: draftText" in js:
-                        return make_proc(
-                            stdout=json.dumps(
-                                {
-                                    "ok": True,
-                                    "data": {
-                                        "text": json.dumps(
-                                            {
-                                                "url": OFFICIAL_PROJECT_URL,
-                                                "editor_found": True,
-                                                "draft_text": prompt2,
-                                                "send_button": {"found": True, "visible": True, "disabled": False, "aria_disabled": False},
-                                                "project_text": bridge.OFFICIAL_PROJECT_ID,
-                                                "model_text": "Gemini Pro",
-                                                "error_banners": [],
-                                                "visible_text": "",
-                                            }
-                                        )
-                                    },
-                                }
-                            )
+                        return make_real_exec_js_proc(
+                            {
+                                "url": OFFICIAL_PROJECT_URL,
+                                "editor_found": True,
+                                "draft_text": prompt2,
+                                "send_button": {"found": True, "visible": True, "disabled": False, "aria_disabled": False},
+                                "project_button": {"found": True, "text": "gemini-bridge", "aria_label": "Select project, current: gemini-bridge"},
+                                "model_button": {"found": True, "text": "Gemini 4 Neon High", "aria_label": "Select model"},
+                                "error_banners": [],
+                                "dialog_texts": [],
+                            }
                         )
                     if "btn.click()" in js:
-                        return make_proc(stdout=json.dumps({"ok": True, "data": {"text": json.dumps({"clicked": True, "url": OFFICIAL_CONV_URL})}}))
+                        return make_real_exec_js_proc({"clicked": True, "url": OFFICIAL_CONV_URL}, page_url=OFFICIAL_CONV_URL)
                     if "has_stop_button" in js:
-                        return make_proc(
-                            stdout=json.dumps(
-                                {
-                                    "ok": True,
-                                    "data": {
-                                        "text": json.dumps(
-                                            {
-                                                "url": OFFICIAL_CONV_URL,
-                                                "running": True,
-                                                "error_banners": [],
-                                                "assistant_messages": [],
-                                                "user_messages": [prompt2],
-                                                "marker_in_conversation": True,
-                                                "visible_text": f"[{v2['task_marker']}]",
-                                            }
-                                        )
-                                    },
-                                }
-                            )
+                        return make_real_exec_js_proc(
+                            {
+                                "url": OFFICIAL_CONV_URL,
+                                "running": True,
+                                "error_banners": [],
+                                "dialog_texts": [],
+                                "turns": [{"role": "user", "text": prompt2}],
+                                "marker_in_conversation": True,
+                            },
+                            page_url=OFFICIAL_CONV_URL,
                         )
                 raise AssertionError(f"Unexpected browser call: {argv}")
 
             args2_sub = bridge.build_parser().parse_args(
-                ["submit", "--contract", str(c2_path), "--state-dir", str(state_dir), "--tab-id", "t2"]
+                ["submit", "--contract", str(c2_path), "--state-dir", str(state_dir), "--tab-id", "4"]
             )
             code2, out2 = bridge.cmd_submit(
                 args2_sub,
@@ -1131,32 +1105,34 @@ class TestCliHelpAndValidateEntrypoint(unittest.TestCase):
                     "url": OFFICIAL_CONV_URL,
                     "running": False,
                     "error_banners": ["Network error occurred"],
-                    "assistant_messages": [],
-                    "user_messages": ["prompt"],
+                    "dialog_texts": [],
+                    "turns": [{"role": "user", "text": f"[{validated['task_marker']}] task"}],
                     "marker_in_conversation": True,
-                    "visible_text": "Network error occurred",
                 },
                 {
                     "url": OFFICIAL_CONV_URL,
                     "running": False,
                     "error_banners": [],
-                    "assistant_messages": ["Finished pushing commit."],
-                    "user_messages": ["prompt"],
+                    "dialog_texts": [],
+                    "turns": [
+                        {"role": "user", "text": f"[{validated['task_marker']}] task"},
+                        {"role": "assistant", "text": "Finished pushing commit."},
+                    ],
                     "marker_in_conversation": True,
-                    "visible_text": "Done",
                 },
             ]
             idx = {"n": 0}
 
             def status_runner(argv, timeout):
-                if argv[1] == "eval":
+                if argv[1] == "execute_js":
+                    self.assertEqual(argv[:5], ["minis-browser-use", "execute_js", "--tab-id", "4", "--script"])
                     cur = responses[idx["n"]]
                     idx["n"] += 1
-                    return make_proc(stdout=json.dumps({"ok": True, "data": {"text": json.dumps(cur)}}))
+                    return make_real_exec_js_proc(cur, page_url=OFFICIAL_CONV_URL)
                 raise AssertionError(f"Unexpected browser call: {argv}")
 
             args = bridge.build_parser().parse_args(
-                ["status", "--contract", str(cpath), "--state-dir", str(state_dir), "--tab-id", "t-status"]
+                ["status", "--contract", str(cpath), "--state-dir", str(state_dir), "--tab-id", "4"]
             )
             browser = bridge.BrowserUseClient(runner=status_runner)
             c1, o1 = bridge.cmd_status(args, browser_client=browser)
@@ -1182,17 +1158,17 @@ class TestCliHelpAndValidateEntrypoint(unittest.TestCase):
             "editor_found": True,
             "draft_text": "EXACT PROMPT",
             "send_button": {"found": True, "visible": True, "disabled": False, "aria_disabled": False},
-            "project_text": bridge.OFFICIAL_PROJECT_ID,
-            "model_text": "Gemini Pro",
+            "project_button": {"found": True, "text": "gemini-bridge", "aria_label": "Select project, current: gemini-bridge"},
+            "model_button": {"found": True, "text": "Gemini 4 Neon High", "aria_label": "Select model"},
             "error_banners": [],
-            "visible_text": "",
+            "dialog_texts": [],
         }
         # Exact match passes
         bridge._verify_pre_send_ui(
             {"parsed": dict(base_payload)},
             expected_prompt="EXACT PROMPT",
             expected_project=bridge.OFFICIAL_PROJECT_ID,
-            expected_model="Pro",
+            expected_model="Gemini 4 Neon High",
         )
         # Draft mismatch fails
         bad_draft = dict(base_payload, draft_text="EXACT PROMP")
@@ -1201,31 +1177,292 @@ class TestCliHelpAndValidateEntrypoint(unittest.TestCase):
                 {"parsed": bad_draft},
                 expected_prompt="EXACT PROMPT",
                 expected_project=bridge.OFFICIAL_PROJECT_ID,
-                expected_model="Pro",
+                expected_model="Gemini 4 Neon High",
             )
         self.assertEqual(ctx1.exception.code, "draft_mismatch")
 
         # Wrong model fails
-        bad_model = dict(base_payload, model_text="Ultra Paid Credits")
+        bad_model = dict(base_payload, model_button={"found": True, "text": "Ultra Paid Credits", "aria_label": "Select model"})
         with self.assertRaises(bridge.BrowserError) as ctx2:
             bridge._verify_pre_send_ui(
                 {"parsed": bad_model},
                 expected_prompt="EXACT PROMPT",
                 expected_project=bridge.OFFICIAL_PROJECT_ID,
-                expected_model="Pro",
+                expected_model="Gemini 4 Neon High",
             )
         self.assertEqual(ctx2.exception.code, "unexpected_model")
 
-        # Wrong project fails
-        bad_project = dict(base_payload, url=f"{bridge.OFFICIAL_REMOTE_BASE}/projects/other-proj", project_text="other")
+        # Wrong project fails (old /projects/<id> path without ?project= query must also fail!)
+        bad_project = dict(base_payload, url=f"{bridge.OFFICIAL_REMOTE_BASE}/projects/{bridge.OFFICIAL_PROJECT_ID}")
         with self.assertRaises(bridge.BrowserError) as ctx3:
             bridge._verify_pre_send_ui(
                 {"parsed": bad_project},
                 expected_prompt="EXACT PROMPT",
                 expected_project=bridge.OFFICIAL_PROJECT_ID,
-                expected_model="Pro",
+                expected_model="Gemini 4 Neon High",
             )
         self.assertEqual(ctx3.exception.code, "unexpected_project")
+
+
+class TestRealMinisProtocolFixturesAndRegressions(unittest.TestCase):
+    """Regressions built directly from committed orchestration/bootstrap/protocol-fixtures.json."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.fixtures = json.loads(FIXTURES_PATH.read_text(encoding="utf-8"))
+
+    def test_real_cli_argv_contract_list_new_navigate_execute_js(self):
+        seen: list[list[str]] = []
+
+        def fake_runner(argv, timeout):
+            seen.append(list(argv))
+            action = argv[1]
+            if action == "list_tabs":
+                return make_proc(stdout=json.dumps(self.fixtures["browser-tabs-real.json"]))
+            if action == "new_tab":
+                return make_proc(
+                    stdout=json.dumps(
+                        {
+                            "action": "new_tab",
+                            "ok": True,
+                            "data": {
+                                "success": True,
+                                "text": f"Opened new tab 7 at {OFFICIAL_PROJECT_URL}",
+                            },
+                        }
+                    )
+                )
+            if action == "navigate":
+                return make_proc(stdout=json.dumps({"ok": True, "data": {"success": True, "page_url": OFFICIAL_PROJECT_URL}}))
+            if action == "execute_js":
+                return make_proc(stdout=json.dumps(self.fixtures["browser-object-real.json"]))
+            raise AssertionError(f"Unexpected action: {argv}")
+
+        client = bridge.BrowserUseClient(runner=fake_runner)
+        tabs = client.list_tabs()
+        self.assertEqual(tabs, [{"tab_id": "4", "url": OFFICIAL_PROJECT_URL, "title": "Google Antigravity"}])
+        new_tid = client.open_url(OFFICIAL_PROJECT_URL)
+        self.assertEqual(new_tid, "7")
+        client.navigate("4", OFFICIAL_PROJECT_URL)
+        res = client.eval_js("4", "return {probe: true};")
+        self.assertEqual(res["parsed"]["probe"], True)
+        self.assertEqual(res["tab_id"], "4")
+        self.assertEqual(res["page_url"], self.fixtures["browser-object-real.json"]["data"]["page_url"])
+
+        self.assertEqual(
+            seen,
+            [
+                ["minis-browser-use", "list_tabs"],
+                ["minis-browser-use", "new_tab", "--url", OFFICIAL_PROJECT_URL],
+                ["minis-browser-use", "navigate", "--tab-id", "4", "--url", OFFICIAL_PROJECT_URL],
+                ["minis-browser-use", "execute_js", "--tab-id", "4", "--script", "return {probe: true};"],
+            ],
+        )
+
+    def test_real_fixtures_json_plus_tab_suffix_null_return_and_success_false(self):
+        # browser-object-real.json & browser-string-real.json
+        for key in ("browser-object-real.json", "browser-string-real.json"):
+            with self.subTest(fixture=key):
+                env = bridge.parse_browser_envelope(json.dumps(self.fixtures[key]))
+                self.assertEqual(env["parsed"]["probe"], True)
+                self.assertEqual(env["tab_id"], "4")
+                self.assertEqual(env["page_url"], OFFICIAL_CONV_URL)
+                self.assertFalse(env["parsed_is_null"])
+
+        # browser-iife-real.json ("null\n  tab_id: 4") must fail closed in status & pre-send
+        null_env = bridge.parse_browser_envelope(json.dumps(self.fixtures["browser-iife-real.json"]))
+        self.assertTrue(null_env["parsed_is_null"])
+        self.assertEqual(null_env["tab_id"], "4")
+        self.assertEqual(null_env["page_url"], OFFICIAL_CONV_URL)
+        st = bridge.classify_ui_status(null_env)
+        self.assertEqual(st["classification"], "blocked")
+        self.assertEqual(st["reason"], "null_js_return")
+        with self.assertRaises(bridge.BrowserError) as ctx:
+            bridge._verify_pre_send_ui(
+                null_env,
+                expected_prompt="x",
+                expected_project=bridge.OFFICIAL_PROJECT_ID,
+                expected_model=bridge.DEFAULT_EXPECTED_MODEL,
+            )
+        self.assertEqual(ctx.exception.code, "null_js_return")
+
+        # data.success=false must raise BrowserError even when ok=true
+        failed_data = {
+            "action": "execute_js",
+            "ok": True,
+            "data": {"success": False, "text": "Tab not found", "page_url": OFFICIAL_PROJECT_URL},
+        }
+        with self.assertRaises(bridge.BrowserError) as ctx_fail:
+            bridge.parse_browser_envelope(json.dumps(failed_data))
+        self.assertEqual(ctx_fail.exception.code, "browser_action_failed")
+
+    def test_real_multiline_tab_parsing_numeric_only_and_reject_ambiguity(self):
+        multi_text = (
+            "Open tabs:\n"
+            "  Tab 2: CLI 故障排查 — https://antigravity.google/docs/cli/troubleshooting/\n"
+            f"  Tab 4: Google Antigravity — {OFFICIAL_PROJECT_URL} *"
+        )
+        env = bridge.parse_browser_envelope(
+            json.dumps({"action": "list_tabs", "ok": True, "data": {"success": True, "text": multi_text}})
+        )
+        tabs = bridge.parse_tabs_from_envelope(env)
+        self.assertEqual(len(tabs), 2)
+        self.assertEqual(tabs[0]["tab_id"], "2")
+        self.assertEqual(tabs[1]["tab_id"], "4")
+        self.assertEqual(tabs[1]["url"], OFFICIAL_PROJECT_URL)
+
+        # Reject non-numeric tab IDs and malformed tab lines
+        for bad_tid in ("Tab", "t-1", "-1", "", True):
+            with self.subTest(bad_tid=bad_tid):
+                with self.assertRaises(bridge.ValidationError):
+                    bridge.validate_tab_id(bad_tid)
+
+        malformed_env = bridge.parse_browser_envelope(
+            json.dumps({"ok": True, "data": {"success": True, "text": "Open tabs:\n  Tab abc: Broken line"}})
+        )
+        with self.assertRaises(bridge.BrowserError) as ctx:
+            bridge.parse_tabs_from_envelope(malformed_env)
+        self.assertEqual(ctx.exception.code, "malformed_tab_output")
+
+    def test_all_js_scripts_have_explicit_return_real_selectors_and_no_control_chars(self):
+        scripts = {
+            "focus": bridge.JS_FOCUS_SELECT_ALL,
+            "paste": bridge.build_paste_js("hello\nworld"),
+            "inspect": bridge.build_inspect_draft_js("GPT-GEMINI-TASK:probe:attempt-01:1234567890ab"),
+            "click": bridge.JS_CLICK_SEND,
+            "status": bridge.build_status_inspect_js("GPT-GEMINI-TASK:probe:attempt-01:1234567890ab"),
+        }
+        for name, js in scripts.items():
+            with self.subTest(script=name):
+                self.assertTrue(js.startswith("return "), f"{name} must have explicit top-level return")
+                self.assertNotIn("\x08", js, f"{name} must not contain backspace control char")
+                bad_ctrl = [ch for ch in js if ord(ch) < 32 and ch not in ("\n", "\t")]
+                self.assertEqual(bad_ctrl, [], f"{name} contains forbidden control chars: {bad_ctrl!r}")
+
+        # Verify exact real DOM selectors from revision-01.md
+        self.assertIn('[contenteditable="true"][aria-label="Message input"]', scripts["focus"])
+        self.assertIn('button[data-testid="model-selector-trigger"]', scripts["inspect"])
+        self.assertIn('button[aria-label^="Select model"]', scripts["inspect"])
+        self.assertIn('button[aria-label^="Select project, current:"]', scripts["inspect"])
+        self.assertIn('button[aria-label="Send message"]', scripts["inspect"])
+        self.assertIn('button[data-testid="send-button"]', scripts["inspect"])
+        self.assertIn('button[aria-label="Cancel (Ctrl+D)"]', scripts["status"])
+        self.assertIn('[data-testid="user-message"]', scripts["status"])
+        self.assertIn('[data-testid="user-message-content"]', scripts["status"])
+        self.assertIn('[data-testid="agent-response"]', scripts["status"])
+
+    def test_prompt_body_text_cannot_spoof_model_or_project_verification(self):
+        # Even if prompt/body text mentions Gemini 4 Neon High and the real project UUID,
+        # missing/mismatched real model button or mismatched URL ?project= MUST fail!
+        spoofed_model_payload = {
+            "url": OFFICIAL_PROJECT_URL,
+            "editor_found": True,
+            "draft_text": f"Model: Gemini 4 Neon High\nProject: {bridge.OFFICIAL_PROJECT_ID}",
+            "visible_text": f"Gemini 4 Neon High {bridge.OFFICIAL_PROJECT_ID}",
+            "send_button": {"found": True, "visible": True, "disabled": False, "aria_disabled": False},
+            "project_button": {"found": True, "text": "gemini-bridge", "aria_label": "Select project, current: gemini-bridge"},
+            "model_button": {"found": False, "text": "", "aria_label": ""},
+            "error_banners": [],
+            "dialog_texts": [],
+        }
+        with self.assertRaises(bridge.BrowserError) as ctx_m:
+            bridge._verify_pre_send_ui(
+                {"parsed": spoofed_model_payload},
+                expected_prompt=spoofed_model_payload["draft_text"],
+                expected_project=bridge.OFFICIAL_PROJECT_ID,
+                expected_model="Gemini 4 Neon High",
+            )
+        self.assertEqual(ctx_m.exception.code, "model_selector_not_found")
+
+        spoofed_project_payload = dict(
+            spoofed_model_payload,
+            url=f"{bridge.OFFICIAL_REMOTE_BASE}?project=00000000-0000-0000-0000-000000000000",
+            model_button={"found": True, "text": "Gemini 4 Neon High", "aria_label": "Select model"},
+        )
+        with self.assertRaises(bridge.BrowserError) as ctx_p:
+            bridge._verify_pre_send_ui(
+                {"parsed": spoofed_project_payload},
+                expected_prompt=spoofed_project_payload["draft_text"],
+                expected_project=bridge.OFFICIAL_PROJECT_ID,
+                expected_model="Gemini 4 Neon High",
+            )
+        self.assertEqual(ctx_p.exception.code, "unexpected_project")
+
+    def test_user_prompt_error_words_do_not_false_block_and_old_assistant_reply_ignored(self):
+        marker = "GPT-GEMINI-TASK:auth-tests:attempt-01:abcdef123456"
+        # User goal mentions sign in / rate limit / captcha / Verify your account to continue.
+        # Assistant reply after marker reports normal completion -> must classify as returned (not blocked!)
+        env_clean = bridge.parse_browser_envelope(
+            make_real_exec_js_proc(
+                {
+                    "url": OFFICIAL_CONV_URL,
+                    "running": False,
+                    "error_banners": [],
+                    "dialog_texts": [],
+                    "turns": [
+                        {
+                            "role": "user",
+                            "text": (
+                                f"[{marker}] Write tests for sign in, rate limit, captcha, "
+                                "and Verify your account to continue."
+                            ),
+                        },
+                        {
+                            "role": "assistant",
+                            "text": "Added regression tests and pushed branch gpt-gemini/jobs/auth-tests.",
+                        },
+                    ],
+                    "marker_in_conversation": True,
+                },
+                page_url=OFFICIAL_CONV_URL,
+            ).stdout
+        )
+        res_clean = bridge.classify_ui_status(env_clean, task_marker=marker)
+        self.assertEqual(res_clean["classification"], "returned")
+        self.assertFalse(res_clean["accepted"])
+
+        # Real Google assistant reply "Verify your account to continue." AFTER marker -> blocked!
+        env_verify = bridge.parse_browser_envelope(
+            make_real_exec_js_proc(
+                {
+                    "url": OFFICIAL_CONV_URL,
+                    "running": False,
+                    "error_banners": [],
+                    "dialog_texts": [],
+                    "turns": [
+                        {"role": "user", "text": f"[{marker}] Implement feature."},
+                        {"role": "assistant", "text": "Verify your account to continue."},
+                    ],
+                    "marker_in_conversation": True,
+                },
+                page_url=OFFICIAL_CONV_URL,
+            ).stdout
+        )
+        res_verify = bridge.classify_ui_status(env_verify, task_marker=marker)
+        self.assertEqual(res_verify["classification"], "blocked")
+        self.assertEqual(res_verify["reason"], "identity_or_verification")
+
+        # Old assistant reply BEFORE the new task marker must NOT classify the new task as returned!
+        env_stale = bridge.parse_browser_envelope(
+            make_real_exec_js_proc(
+                {
+                    "url": OFFICIAL_CONV_URL,
+                    "running": False,
+                    "error_banners": [],
+                    "dialog_texts": [],
+                    "turns": [
+                        {"role": "user", "text": "[GPT-GEMINI-TASK:old:attempt-01:111111111111] Old task"},
+                        {"role": "assistant", "text": "Old task completed and pushed."},
+                        {"role": "user", "text": f"[{marker}] New task"},
+                    ],
+                    "marker_in_conversation": True,
+                },
+                page_url=OFFICIAL_CONV_URL,
+            ).stdout
+        )
+        res_stale = bridge.classify_ui_status(env_stale, task_marker=marker)
+        self.assertEqual(res_stale["classification"], "blocked")
+        self.assertEqual(res_stale["reason"], "no_assistant_response_or_unconfirmed")
 
 
 if __name__ == "__main__":

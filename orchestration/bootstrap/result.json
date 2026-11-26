@@ -1,9 +1,20 @@
 {
   "task_id": "bootstrap-gpt-gemini-v1",
+  "revision": 1,
   "repository": "yinanan77/gemini-bridge",
   "branch": "workflow/gpt-gemini-v1",
   "status": "completed",
-  "summary": "Implemented stdlib-only fail-closed Minis GPT -> official Gemini Pro web agent -> GitHub -> GPT bridge CLI (validate, submit, status, collect), mocked unit test suite, concise Chinese operating manual, and example contract.",
+  "summary": "Applied targeted revision-01 fixes against real Minis CLI protocol and DOM fixtures: fixed minis-browser-use subcommands/flags (list_tabs, new_tab --url, navigate --tab-id --url, execute_js --tab-id --script), explicit top-level JS return statements, JSON + trailing tab_id suffix / page_url / data.success=false parsing, strict numeric tab ID parsing, real ?project= query URL, real Gemini 4 Neon High model selector button verification, anti-spoofing project/model validation, real data-testid DOM selectors, raw-string JS regex (eliminating \\x08 backspace escape), scoped error scanning excluding user prompt text, old assistant reply isolation, and Verify your account to continue. blocking.",
+  "revision_fixes": [
+    "BrowserUseClient switched to real minis-browser-use actions/flags: list_tabs, new_tab --url, navigate --tab-id ID --url URL, execute_js --tab-id ID --script SCRIPT with strict numeric tab_id validation.",
+    "All execute_js scripts now use explicit top-level return (() => { ... })(); and raw Python strings with zero ASCII control characters (eliminating the \\x08 backspace regex bug).",
+    "parse_browser_envelope now handles data.success=false, data.page_url, strict JSON + bounded trailing \\n  tab_id: N suffix, and fail-closed null return handling.",
+    "parse_tabs_from_envelope strictly parses real 'Tab N: Title — URL [*]' and 'Opened new tab N at URL' lines into numeric tab IDs and rejects malformed/ambiguous tab lines.",
+    "Updated default project URL to https://antigravity.google.com/remote?project=561adc82-06e6-4c8c-862f-3ac493b947c1 and default model to Gemini 4 Neon High; project and model verification now strictly inspect URL ?project= / project selector and model selector button only (never spoofable via prompt/body text).",
+    "Updated DOM selectors to real page attributes ([contenteditable=true][aria-label=\"Message input\"], button[data-testid=\"model-selector-trigger\"], button[aria-label^=\"Select model\"], button[aria-label^=\"Select project, current:\"], [data-testid=\"user-message\"], [data-testid=\"user-message-content\"], [data-testid=\"agent-response\"], button[aria-label=\"Send message\"], button[data-testid=\"send-button\"], button[aria-label=\"Cancel (Ctrl+D)\"]).",
+    "Scoped error/auth detection to explicit banners, dialogs, URL, and assistant replies AFTER task_marker; added 'Verify your account to continue.' detection while preventing user task text from triggering false blocks and preventing old assistant replies from marking a new task returned.",
+    "Added regression tests directly exercising committed orchestration/bootstrap/protocol-fixtures.json."
+  ],
   "files": [
     "bridge/minis_gemini_bridge.py",
     "bridge/test_bridge.py",
@@ -11,22 +22,29 @@
     "bridge/task.example.json",
     "orchestration/bootstrap/result.json"
   ],
+  "preserved_inputs_and_evidence": [
+    "orchestration/bootstrap/task.json",
+    "orchestration/bootstrap/revision-01.md",
+    "orchestration/bootstrap/protocol-fixtures.json",
+    "README.md"
+  ],
   "tests": {
     "compile_command": "python3 -m py_compile bridge/minis_gemini_bridge.py",
     "compile_exit_code": 0,
     "unit_test_command": "python3 -m unittest discover -s bridge -p test_bridge.py",
-    "passed": 27,
+    "passed": 33,
     "failed": 0,
     "errors": 0,
+    "fixture_file_tested": "orchestration/bootstrap/protocol-fixtures.json",
     "mocked_external_clis": [
       "minis-browser-use",
       "minis-mcp-cli"
     ]
   },
   "runtime_unverified_limitations": [
-    "Local Minis executables (minis-browser-use and minis-mcp-cli) are not present in the cloud sandbox; all subprocess interactions were verified only via unit test mocks.",
-    "Live Antigravity web UI DOM selectors (editor, model selector, project header, send/stop buttons, assistant/user message containers, and error banners) have not been executed against a live Minis browser session.",
-    "Real GitHub MCP tool argument names and response envelopes on the target iOS Minis Alpine aarch64 host have not been exercised end-to-end.",
-    "Human sign-in/verification handling, Pro quota behavior, and iOS app suspension/resume behavior require independent verification on Minis by GPT."
+    "Local Minis executables (minis-browser-use and minis-mcp-cli) are unavailable in this cloud sandbox; unit and fixture regression tests run against recorded fixtures and mocks only.",
+    "Live end-to-end execution of list_tabs, new_tab, navigate, execute_js (focus+selectAll, ClipboardEvent paste, draft/model/project/send inspection, click, status) against the live Antigravity page on iOS Minis has not been executed from this sandbox.",
+    "Live GitHub MCP create_branch/create_or_update_file/list_commits/get_file_contents calls on iOS Minis have not been executed end-to-end from this sandbox.",
+    "Human sign-in/verification handling, Pro quota enforcement, and iOS app suspension/resume require live runtime verification by GPT on Minis."
   ]
 }
