@@ -115,18 +115,22 @@ _EXPLICIT_VISUAL_EXACT = frozenset(
     }
 )
 _EXPLICIT_VISUAL_CUE_RE = re.compile(
-    r"(无底部解释性字幕|无解释性字幕|无底部字幕|无对白|无台词|无口播|"
-    r"纯画面|仅画面|画面[：:]|\[画面|【画面|（画面|\(画面|空镜|转场画面|"
-    r"表情停顿|成品尾留|反应近景|近景|特写|仅字幕|小字[“\"「『：:])"
+    r"(无底部解释性字幕|无解释性字幕|无底部字幕|无对白|无台词|无口播|未说话|"
+    r"纯画面|仅画面|画面[：:]|画面(?:展示|切|特写|推进|拉近|拉远|过渡|停留)|"
+    r"\[画面|【画面|（画面|\(画面|空镜|转场画面|纯动作|动作演示|片头|片尾|LOGO|"
+    r"表情停顿|成品尾留|反应近景|近景|特写|镜头|仅字幕|小字[“\"「『：:])",
+    re.IGNORECASE,
 )
 _PURE_BRACKET_VISUAL_RE = re.compile(
-    r"^(?:[\[\【（(][^\]\】）)]*(?:画面|无对白|无台词|无口播|空镜|转场|字幕|花字|近景|表情停顿|尾留)[^\]\】）)]*[\]\】）)]\s*)+$"
+    r"^(?:[\[\【（(][^\]\】）)]*(?:画面|无对白|无台词|无口播|未说话|空镜|转场|字幕|花字|近景|特写|镜头|动作|演示|片头|片尾|LOGO|表情停顿|尾留)[^\]\】）)]*[\]\】）)]\s*)+$",
+    re.IGNORECASE,
 )
 _SECRET_REDACT_RE = re.compile(
     r"(Bearer\s+[A-Za-z0-9._\-]+|secret_[A-Za-z0-9_\-]+|ntn_[A-Za-z0-9_\-]+|"
     r"(?:api[_-]?key|token|authorization|password)\s*[:=]\s*['\"]?[^\s'\"]+['\"]?)",
     re.IGNORECASE,
 )
+_OS_ROOT_SYMLINK_EXEMPT = frozenset({"/tmp", "/var", "/etc"})
 
 
 class ConsolidateError(Exception):
@@ -214,6 +218,37 @@ def redact_secrets(text: str) -> str:
     return _SECRET_REDACT_RE.sub("[REDACTED]", text)
 
 
+def summarize_subprocess_error(
+    cmd_label: str, returncode: int, stderr: str = "", stdout: str = ""
+) -> str:
+    """Summarize a non-zero subprocess exit WITHOUT echoing raw stderr/stdout that may contain private body text."""
+    combined = f"{stderr or ''}\n{stdout or ''}"
+    lower = combined.lower()
+    reasons: list[str] = []
+    if any(tok in lower for tok in ("401", "unauthorized", "auth failed", "bad credentials", "token")):
+        reasons.append("auth_error")
+    elif any(tok in lower for tok in ("403", "forbidden", "permission denied")):
+        reasons.append("permission_denied")
+    elif any(tok in lower for tok in ("404", "not found")):
+        reasons.append("not_found")
+    elif any(tok in lower for tok in ("429", "rate limit")):
+        reasons.append("rate_limited")
+    elif any(tok in lower for tok in ("503", "502", "500", "service unavailable", "gateway")):
+        reasons.append("upstream_error")
+    elif "timeout" in lower or "timed out" in lower:
+        reasons.append("timeout")
+
+    secret_detected = bool(_SECRET_REDACT_RE.search(combined))
+    parts = [f"{cmd_label} exited with code {returncode}"]
+    if reasons:
+        parts.append(f"reason={','.join(reasons)}")
+    if secret_detected:
+        parts.append("[REDACTED] credential-like output suppressed")
+    elif combined.strip():
+        parts.append("raw output suppressed to prevent private content leakage")
+    return "; ".join(parts)
+
+
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -222,34 +257,47 @@ def sha256_text(text: str) -> str:
     return sha256_bytes(text.encode("utf-8"))
 
 
-def check_no_symlink_chain(path: Path, stop_at: Path | None = None) -> None:
-    """Reject symlink at `path` or any component between `stop_at` and `path`.
+def _check_all_ancestors_no_symlink(path: Path) -> None:
+    """Walk every ancestor component from filesystem root to `path` and reject any symlink.
 
-    When `stop_at` is None, checks `path` itself and any non-system parent
-    segments only if `path` is relative, plus `path.is_symlink()`.
+    Exempts only standard OS-level depth-1 mount symlinks (`/tmp`, `/var`, `/etc`).
     """
-    if path.is_symlink():
-        raise PathSafetyError(f"Refusing symlink path: {path}")
+    raw_str = os.fspath(path)
+    if ".." in Path(raw_str).parts:
+        raise PathSafetyError(f"Path traversal segment rejected: {path}")
+    abs_path = Path(os.path.abspath(raw_str))
+    cur = Path(abs_path.anchor) if abs_path.anchor else Path("/")
+    for idx, part in enumerate(abs_path.parts):
+        if idx == 0 and part == abs_path.anchor:
+            continue
+        cur = cur / part
+        if len(cur.parts) == 2 and str(cur) in _OS_ROOT_SYMLINK_EXEMPT:
+            continue
+        if cur.is_symlink():
+            raise PathSafetyError(f"Refusing symlink path component: {cur}")
+
+
+def check_no_symlink_chain(path: Path, stop_at: Path | None = None) -> None:
+    """Reject symlink at `path` or ANY ancestor component (and enforce root containment when `stop_at` is set)."""
+    _check_all_ancestors_no_symlink(path)
     if stop_at is not None:
-        if stop_at.is_symlink():
-            raise PathSafetyError(f"Refusing symlink root path: {stop_at}")
-        root_resolved = stop_at.resolve()
+        _check_all_ancestors_no_symlink(stop_at)
+        root_abs = Path(os.path.abspath(os.fspath(stop_at)))
+        path_abs = Path(os.path.abspath(os.fspath(path)))
         try:
-            rel = path.relative_to(stop_at)
-        except ValueError:
-            try:
-                rel = path.resolve().relative_to(root_resolved)
-            except ValueError as exc:
-                raise PathSafetyError(
-                    f"Path escapes allowed root directory: {path} (root: {stop_at})"
-                ) from exc
+            rel = path_abs.relative_to(root_abs)
+        except ValueError as exc:
+            raise PathSafetyError(
+                f"Path escapes allowed root directory: {path} (root: {stop_at})"
+            ) from exc
         if ".." in rel.parts:
             raise PathSafetyError(f"Path traversal segment rejected: {path}")
-        cur = stop_at
+        cur = root_abs
         for part in rel.parts:
             cur = cur / part
             if cur.is_symlink():
                 raise PathSafetyError(f"Refusing symlink component: {cur}")
+        root_resolved = stop_at.resolve()
         resolved = path.resolve()
         try:
             resolved.relative_to(root_resolved)
@@ -260,9 +308,8 @@ def check_no_symlink_chain(path: Path, stop_at: Path | None = None) -> None:
 
 
 def ensure_safe_file_read(path: Path) -> None:
-    """Reject symlinked input file or directory."""
-    if path.is_symlink():
-        raise PathSafetyError(f"Refusing symlink input path: {path}")
+    """Reject symlinked input file or any symlinked ancestor directory."""
+    check_no_symlink_chain(path)
     if not path.exists():
         raise ConsolidateError(f"Input file does not exist: {path}")
     if not path.is_file():
@@ -270,14 +317,12 @@ def ensure_safe_file_read(path: Path) -> None:
 
 
 def atomic_write_bytes(path: Path, data: bytes, *, root: Path | None = None) -> None:
-    """Atomically write bytes after verifying symlink safety."""
+    """Atomically write bytes after verifying full ancestor symlink safety."""
     check_no_symlink_chain(path, stop_at=root)
     parent = path.parent
-    if parent.is_symlink():
-        raise PathSafetyError(f"Refusing symlink parent directory: {parent}")
     parent.mkdir(parents=True, exist_ok=True)
-    if path.is_symlink():
-        raise PathSafetyError(f"Refusing to overwrite symlink: {path}")
+    # Re-verify after mkdir in case of race or pre-existing symlink.
+    check_no_symlink_chain(path, stop_at=root)
 
     fd, tmp_name = tempfile.mkstemp(prefix=".tmp_black9_", dir=str(parent))
     tmp_path = Path(tmp_name)
@@ -371,7 +416,7 @@ def parse_case_table(section_lines: Sequence[str], case_id: str) -> list[UnitRow
     """Extract all Markdown table data rows from an Appendix B case section."""
     idx = 0
     total = len(section_lines)
-    table_found = False
+    table_count = 0
     rows: list[UnitRow] = []
 
     while idx < total:
@@ -380,11 +425,19 @@ def parse_case_table(section_lines: Sequence[str], case_id: str) -> list[UnitRow
             header_cells = split_markdown_table_row(line)
             sep_cells = split_markdown_table_row(section_lines[idx + 1])
             if (
-                len(header_cells) == 4
+                len(header_cells) >= 2
                 and len(sep_cells) == len(header_cells)
                 and is_table_separator_row(sep_cells)
             ):
-                table_found = True
+                table_count += 1
+                if table_count > 1:
+                    raise SourceParseError(
+                        f"{case_id}: expected exactly 1 Markdown pipe table, found multiple"
+                    )
+                if len(header_cells) != 4:
+                    raise SourceParseError(
+                        f"{case_id}: expected 4 table columns in header, got {len(header_cells)}"
+                    )
                 idx += 2
                 row_num = len(rows)
                 while idx < total:
@@ -421,7 +474,7 @@ def parse_case_table(section_lines: Sequence[str], case_id: str) -> list[UnitRow
                 continue
         idx += 1
 
-    if not table_found:
+    if table_count == 0:
         raise SourceParseError(f"{case_id}: no valid 4-column Markdown pipe table found")
     return rows
 
@@ -432,7 +485,7 @@ def parse_appendix_a_case_table(
     """Extract all 7-column Appendix A group rows from a case section losslessly."""
     idx = 0
     total = len(section_lines)
-    table_found = False
+    table_count = 0
     headers: tuple[str, ...] = DEFAULT_GROUP_HEADERS
     rows: list[GroupRow] = []
 
@@ -442,11 +495,20 @@ def parse_appendix_a_case_table(
             header_cells = split_markdown_table_row(line)
             sep_cells = split_markdown_table_row(section_lines[idx + 1])
             if (
-                len(header_cells) == EXPECTED_GROUP_COLUMNS
-                and len(sep_cells) == EXPECTED_GROUP_COLUMNS
+                len(header_cells) >= 2
+                and len(sep_cells) == len(header_cells)
                 and is_table_separator_row(sep_cells)
             ):
-                table_found = True
+                table_count += 1
+                if table_count > 1:
+                    raise SourceParseError(
+                        f"Appendix A {case_id}: expected exactly 1 Markdown pipe table, found multiple"
+                    )
+                if len(header_cells) != EXPECTED_GROUP_COLUMNS:
+                    raise SourceParseError(
+                        f"Appendix A {case_id}: expected {EXPECTED_GROUP_COLUMNS} table columns in header, "
+                        f"got {len(header_cells)}"
+                    )
                 headers = tuple(
                     cell if cell else DEFAULT_GROUP_HEADERS[col_i]
                     for col_i, cell in enumerate(header_cells)
@@ -497,7 +559,7 @@ def parse_appendix_a_case_table(
                 continue
         idx += 1
 
-    if not table_found:
+    if table_count == 0:
         raise SourceParseError(
             f"Appendix A {case_id}: no valid {EXPECTED_GROUP_COLUMNS}-column Markdown pipe table found"
         )
@@ -1431,15 +1493,12 @@ def resolve_bundle_dir(output_dir: Path, folder_name: str) -> Path:
 
 
 def check_destination_safety(bundle_dir: Path, planned_files: dict[str, bytes]) -> dict[str, str]:
-    """Verify destination has no symlinks and no conflicting or extra files.
+    """Verify destination has no symlinks (including all ancestors) and no conflicting or extra files.
 
     Returns a per-filename status map ("create" or "identical").
     Raises PathSafetyError before writing anything if any check fails.
     """
-    if bundle_dir.is_symlink():
-        raise PathSafetyError(f"Refusing symlink output directory: {bundle_dir}")
-    if bundle_dir.parent.is_symlink():
-        raise PathSafetyError(f"Refusing symlink parent of output directory: {bundle_dir.parent}")
+    check_no_symlink_chain(bundle_dir)
 
     statuses: dict[str, str] = {}
     if not bundle_dir.exists():
@@ -1493,10 +1552,9 @@ def build_bundle(
 ) -> dict[str, Any]:
     """Parse, validate, and deterministically publish the Black9 standalone folder."""
     ensure_safe_file_read(source_path)
-    if output_dir.is_symlink():
-        raise PathSafetyError(f"Refusing symlink output root: {output_dir}")
-    if vault_dir is not None and vault_dir.is_symlink():
-        raise PathSafetyError(f"Refusing symlink vault directory: {vault_dir}")
+    check_no_symlink_chain(output_dir)
+    if vault_dir is not None:
+        check_no_symlink_chain(vault_dir)
 
     clean_supp_urls = tuple(u.strip() for u in supplement_urls if u and u.strip())
     if clean_supp_urls and supplement_path is None:
@@ -1777,25 +1835,46 @@ def build_bundle(
 def extract_notion_content_xml(raw_text: str) -> tuple[str, bool]:
     """Extract inner body from Notion XML wrapper `<content>...</content>` conservatively.
 
-    Returns (extracted_text, had_xml_wrapper). Never drops literal words inside `<content>`.
+    Prioritizes outer `<page>...<content>...</content></page>` or `<content>...</content>`
+    so literal `<content/>` inside the page body NEVER wipes extracted text.
+    Only treats a standalone outer `<content/>` (when no `<content>...</content>` pair exists)
+    as an empty wrapped page. Returns (extracted_text, had_xml_wrapper).
     """
     if not isinstance(raw_text, str):
         raise McpFetchError("Notion fetch text field is not a string")
     normalized = raw_text.replace("\r\n", "\n").replace("\r", "\n")
 
-    if "<content/>" in normalized or "<content />" in normalized:
-        return "", True
+    # Scope to outer <page ...>...</page> envelope when present.
+    scope = normalized
+    page_open = re.search(r"<page(?:\s[^>]*)?>", normalized)
+    page_close_idx = normalized.rfind("</page>") if page_open else -1
+    has_page_shell = bool(page_open and page_close_idx != -1 and page_close_idx >= page_open.end())
+    if has_page_shell:
+        assert page_open is not None
+        scope = normalized[page_open.end() : page_close_idx]
 
-    start_match = re.search(r"<content(?:\s[^>]*)?>", normalized)
+    # Priority 1: Extract paired <content ...>...</content> BEFORE checking self-closing <content/>.
+    start_match = re.search(r"<content(?:\s[^>]*)?>", scope)
     if start_match:
-        end_idx = normalized.rfind("</content>")
+        end_idx = scope.rfind("</content>")
         if end_idx != -1 and end_idx >= start_match.end():
-            inner = normalized[start_match.end() : end_idx]
+            inner = scope[start_match.end() : end_idx]
             if inner.startswith("\n"):
                 inner = inner[1:]
             if inner.endswith("\n"):
                 inner = inner[:-1]
             return inner, True
+
+    # Priority 2: Standalone outer self-closing <content/> at page-shell level (no paired <content>...</content>).
+    if has_page_shell:
+        # Remove optional <properties>...</properties> header block before checking shell body.
+        shell_without_props = re.sub(
+            r"<properties(?:\s[^>]*)?>.*?</properties>", "", scope, flags=re.DOTALL
+        ).strip()
+        if re.fullmatch(r"<content\s*/>", shell_without_props):
+            return "", True
+    elif re.fullmatch(r"<content\s*/>", scope.strip()):
+        return "", True
 
     return normalized, False
 
@@ -1866,20 +1945,14 @@ def fetch_notion_page(
     if not clean_id:
         raise McpFetchError("Notion ID must not be empty")
 
-    if output_file.is_symlink():
-        raise PathSafetyError(f"Refusing symlink output file: {output_file}")
-    if output_file.parent.is_symlink():
-        raise PathSafetyError(f"Refusing symlink output directory: {output_file.parent}")
+    check_no_symlink_chain(output_file)
 
     evidence_path = (
         raw_output_file
         if raw_output_file is not None
         else output_file.with_name(f"{output_file.name}.raw.json")
     )
-    if evidence_path.is_symlink():
-        raise PathSafetyError(f"Refusing symlink raw evidence file: {evidence_path}")
-    if evidence_path.parent.is_symlink():
-        raise PathSafetyError(f"Refusing symlink raw evidence directory: {evidence_path.parent}")
+    check_no_symlink_chain(evidence_path)
 
     payload = json.dumps({"id": clean_id}, ensure_ascii=False)
     cmd = [cli_bin, "call", "Notion", "notion-fetch", payload]
@@ -1898,9 +1971,10 @@ def fetch_notion_page(
         raise McpFetchError(f"MCP notion-fetch timed out after {timeout_sec}s") from exc
 
     if proc.returncode != 0:
-        err_msg = redact_secrets((proc.stderr or proc.stdout or "").strip())[:300]
         raise McpFetchError(
-            f"minis-mcp-cli exited with code {proc.returncode}: {err_msg}"
+            summarize_subprocess_error(
+                "minis-mcp-cli notion-fetch", proc.returncode, proc.stderr, proc.stdout
+            )
         )
 
     parsed = parse_notion_fetch_mcp_response(proc.stdout)

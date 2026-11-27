@@ -165,8 +165,12 @@ class MinisMcpGitHubClient:
             raise sync.McpCallError(f"minis-mcp-cli timed out after {self.timeout_sec}s") from exc
 
         if proc.returncode != 0:
-            snippet = consolidate.redact_secrets((proc.stderr or proc.stdout or "").strip())[:300]
-            raise sync.McpCallError(f"minis-mcp-cli exited with code {proc.returncode}: {snippet}")
+            label = f"minis-mcp-cli {' '.join(args[:3])}" if args else "minis-mcp-cli"
+            raise sync.McpCallError(
+                consolidate.summarize_subprocess_error(
+                    label, proc.returncode, proc.stderr, proc.stdout
+                )
+            )
         return proc.stdout
 
     def discover_schemas(self, *, force: bool = False) -> dict[str, dict[str, Any]]:
@@ -456,16 +460,13 @@ def run_prepare(
     commit_message: str = DEFAULT_COMMIT_MESSAGE,
 ) -> dict[str, Any]:
     """Prepare a safe GitHub `push_files` payload and metadata backups without auto-publishing."""
-    for label, p in (
+    for _, p in (
         ("bundle", bundle_dir),
         ("sync-state", sync_state_path),
         ("vault", vault_dir),
         ("out", out_dir),
     ):
-        if p.is_symlink():
-            raise consolidate.PathSafetyError(f"Refusing symlink {label} path: {p}")
-        if p.parent.is_symlink():
-            raise consolidate.PathSafetyError(f"Refusing symlink parent of {label} path: {p.parent}")
+        consolidate.check_no_symlink_chain(p)
 
     if not vault_dir.exists() or not vault_dir.is_dir():
         raise DeployError(f"Vault directory does not exist or is not a directory: {vault_dir}")
@@ -712,19 +713,12 @@ def run_install(
     Never overwrites existing local `.sync/state.json` or `sync-config.json` automatically;
     explicit `--install-metadata-from` requires `--out` backup directory and backs up first.
     """
-    for label, p in (("bundle", bundle_dir), ("vault", vault_dir)):
-        if p.is_symlink():
-            raise consolidate.PathSafetyError(f"Refusing symlink {label} path: {p}")
-        if p.parent.is_symlink():
-            raise consolidate.PathSafetyError(f"Refusing symlink parent of {label} path: {p.parent}")
+    for _, p in (("bundle", bundle_dir), ("vault", vault_dir)):
+        consolidate.check_no_symlink_chain(p)
     if out_dir is not None:
-        if out_dir.is_symlink() or out_dir.parent.is_symlink():
-            raise consolidate.PathSafetyError(f"Refusing symlink out path: {out_dir}")
+        consolidate.check_no_symlink_chain(out_dir)
     if install_metadata_from is not None:
-        if install_metadata_from.is_symlink():
-            raise consolidate.PathSafetyError(
-                f"Refusing symlink install-metadata-from path: {install_metadata_from}"
-            )
+        consolidate.check_no_symlink_chain(install_metadata_from)
         if out_dir is None:
             raise DeployError(
                 "`--install-metadata-from` requires `--out BACKUP_DIR` so existing local sync metadata is backed up before installation"
@@ -957,8 +951,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "notion": notion_client.inspect_relevant_schemas(),
             }
             if args.output is not None:
-                if args.output.is_symlink():
-                    raise consolidate.PathSafetyError(f"Refusing symlink output: {args.output}")
+                consolidate.check_no_symlink_chain(args.output)
                 data = (
                     json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
                 ).encode("utf-8")

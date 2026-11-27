@@ -92,7 +92,7 @@ python3 tools/black9/sync.py init \
   --state /path/to/black9_sync_state.json
 ```
 
-若遇超时或异常响应，重启默认拒绝继续创建；仅在显式指定 `--recover` 时才按唯一 `task_marker` / 标题调用 `notion-search` 核对并续传剩余项，避免重复建页。
+若遇超时或异常响应，重启默认拒绝继续创建；仅在显式指定 `--recover` 时才优先复用 `state.json` 中已落盘的 `page_id` 并按严格父子归属（仅限当前 `root_parent_id` / `collection_parent_id` 的直接子页，绝不回退全库同名搜索）核对；若远端确认尚未创建，默认拒绝自动重建，仅在显式追加 `--allow-recreate-missing` 时才重新创建缺失页，避免跨集合误绑或重复建页。
 
 ### 5. 准备现有 GitHub Actions 双向同步注册 Payload（`deploy.py prepare`）
 
@@ -130,15 +130,22 @@ python3 tools/black9/deploy.py install \
 
 默认仅复制新建目录的 14 个文件（13 个 `.md` + `manifest.json`），遇到非字节一致文件或多余文件立即中止；若提供 `--out` 则只读备份本地既有 `.sync/state.json` 与 `sync-config.json`，且**不自动覆盖**本地旧同步元数据（正常情况下应在主控提交 `push_files_payload.json` 后由 `git pull` 同步元数据；仅当显式传入 `--install-metadata-from <PREPARED_OUT> --out <BACKUP_DIR>` 时才在完成备份后写入合并元数据）。
 
-### 7. 手工保守三方同步与状态检查（`sync.py sync`）
+### 7. 手工保守三方同步、冲突退出码与安全恢复（`sync.py sync`）
 
 ```bash
 python3 tools/black9/sync.py sync --state /path/to/black9_sync_state.json --status
 python3 tools/black9/sync.py sync --state /path/to/black9_sync_state.json --only C01,C10 --dry-run
 python3 tools/black9/sync.py sync --state /path/to/black9_sync_state.json
+# 若推送遇超时/异步任务/回读不匹配导致 journal 锁定，显式对账恢复：
+python3 tools/black9/sync.py sync --state /path/to/black9_sync_state.json --recover
 ```
 
-支持独立本地/远端规范化基线（保守忽略空行与 `<br/>` 序列化差异，不丢弃原文字词）、推送后强回读校验、双边冲突保存至 `conflicts/` 不互相覆盖，且绝不向 Notion 传播本地删除。
+安全护栏（已通过审计回归防护）：
+- **显式同步更新与异步任务识别**：调用 `notion-update-page` 时，若 schema 声明 `allow_async`，强制传 `allow_async: false`；若远端仍返回 `async_task` 或挂起状态，立即抛出 `AsyncUpdatePendingError` 并记录 `push_async_pending`，绝不误判为成功或静默污染基线。
+- **Schema 与扁平 Markdown 前置校验**：在写入 `send_started` / `push_started` journal 之前，先完成运行时 schema 校验与 `validate_flat_markdown`（拒绝表格、代码块、列表、引用、H4+ 与 `>= 1900` 字符行），本地校验失败绝不锁定 journal 或触碰远端。
+- **Notion 序列化与 XML 外壳防护**：`canonicalize_markdown` 无损规范化 Notion 自动链接（`[https://...](https://...)` / `<https://...>`）、转义符号（`\|` / `\[` / `\]`）、`<br/>` 与空行；XML 提取优先匹配成对 `<content>...</content>`，正文内字面量 `<content/>` 不会清空页面；拉取时强制校验 `<page>/<content>` 外壳并拒绝非空本地文件被空远端或网关告警覆盖。
+- **全祖先路径符号链接检查与错误零正文回显**：`consolidate.py`、`sync.py`、`deploy.py` 全部输入输出路径均从根遍历检查所有祖先目录符号链接；子进程非零退出错误仅输出分类摘要与 `[REDACTED]` 标记，不回显原始 stdout/stderr 正文片段。
+- **冲突非零退出码与严格主源格式约定**：检测到双边冲突时保留双边快照至 `conflicts/`，且 `sync.py sync` 返回非零退出码 `2`（便于脚本/CI 捕获）。主分析源严格要求一级标题 `# 附录A` / `# 附录B`、二级案例标题 `## C01`–`## C11`（`｜`/`:`/`-`/空格分隔），每案单张 7 列（附录A）或 4 列（附录B）表格；不合规范的变体将显式报错中止，避免静默漏解析。
 
 ## 运行本地 Mock 单元测试
 

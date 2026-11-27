@@ -3,7 +3,7 @@
   "attempt": 2,
   "contract_sha256": "639234c7d06ef11a50c9d4f9452503b11b263cb4ec5774257adf4e2ebc23731f",
   "status": "completed",
-  "summary": "基于 commit 37aac5a 完成 Black9 工具集的增量修复与扩展（纯 Python 标准库）：1）修复真实格式画面/混合记录分类（将 C11 B06 表情停顿/无底部解释性字幕、B51 无解释性字幕的成品尾留归为 visual_or_non_spoken，将 C10 A05 反应近景+小字+随后“哈哈”归为 mixed_visual_and_text，其余归为保守的 source_text_unverified），移除口播正文定性与 spoken_count 数值标签，无虚构纯音乐/无声断言，完整保留全部 335 条原始单元；2）在 consolidate.py 新增 # 附录A 7 列分组解析与强校验（11 案映射与精确 108 组）并无损输出至各案例页与 manifest.json；3）新增可选 --supplement 与 --supplement-url（及 --vault 别名），以真实 Notion 导出格式（## 二、黑桃11版本逐段补研究 下 C01–C11 每案一个四列 Markdown 表，表头为“连续原段／阅读摘要｜措辞与对象为什么这样组织｜与前后段的接口｜机械迁移怎样失效”，每表恰好 4 行共 11 表 44 行 176 单元格）为主验收格式，将每个单元格原词无损转换为扁平段落并记录小节标题与列标题，同时兼容 11×4 编号列表测试变体，严格止于 ## 三、思远11版本逐段补研究 之前并排除思远/S01/用户成稿，原样保留 <br> 与富文本标记并记录补研究哈希、表数与行数；4）在 ## 原文逐项 之前新增 ## 文稿连读（依据已存文字，非重新听审），按原序连贯输出未标注画面/混合的已存文字记录且不补写过渡或标点，被排除项保留于显式画面与混合记录清单及原文逐项；5）构建期输出无空行扁平 H1–H3 Markdown（匹配现有 scripts/notion_sync.py 简单渲染器且 init 子页不注入隐藏标记），更新 sync.py 规范化与 preflight；6）新增 tools/black9/deploy.py（inspect/prepare/install），通过 minis-mcp-cli 只读拉取 yinanan77/E-Made 最新 .sync/state.json 与 sync-config.json 并逐页 notion-fetch 校验全文规范化一致后，保留全部既有记录与配置并仅增量注册本目录 13 个页面，导出 push_files_payload.json 供主控显式执行（不自动发布、不改动工作流/定时任务/脚本），install 仅复制新建目录且默认不覆盖本地旧同步元数据。全部 23 项本地 Mock 单元测试与编译/CLI 冒烟检查均通过，未执行真实线上 Notion 或 GitHub 写入。",
+  "summary": "基于 commit 37aac5a 完成 Black9 工具集的增量扩展、--supplement 真实四列表格格式纠正，以及针对独立审计（提交 3152306aa622da79cdef1ac247ade3207f1035ec）F01–F10 全部缺陷的安全修复与回归防护验证（纯 Python 标准库）：1）F01：notion-update-page 显式传 allow_async=false，识别 async_task/挂起状态并抛出 AsyncUpdatePendingError 与落盘 push_async_pending，阻断未对账写入并支持 sync --recover；2）F02：完整无损解析 # 附录A 7 列 108 组、# 附录B 4 列 335 单元及可选 --supplement 真实 11 表 44 行 176 单元格（兼容编号变体，严格排除思远与用户成稿），在 ## 原文逐项 前输出 ## 文稿连读，并提供 deploy.py（inspect/prepare/install）安全生成 yinanan77/E-Made 注册 payload（不自动发布、不改工作流/定时任务）；3）F03：consolidate.py、sync.py、deploy.py 全部路径均从根遍历检查所有祖先目录符号链接，零外部逸出写入；4）F04：init --recover 优先复用 state.json 已落盘 page_id（不依赖 notion-search），子页恢复严格校验当前父页直属子页归属，绝不回退全库同名搜索；缺失页默认拒绝自动重建，仅显式传 --allow-recreate-missing 才重建；5）F05：canonicalize_markdown 无损规范化 Notion URL 自动链接与转义字符，schema 校验前置至写入 send_started/push_started 之前，新增安全 sync --recover 支持 push_confirmed/push_not_applied/conflict_preserved 三类对账；6）F06：XML 提取优先匹配成对 <content>...</content> 避免正文出现字面量 <content/> 清空内容，拉取强制校验 <page>/<content> 外壳并拒绝空远端或非 XML 告警覆盖非空本地文件；7）F07：保守分类覆盖审计画面/混合样本，绝不误标为已核验口播；8）F08：sync 推送前调用 validate_flat_markdown 拦截表格/代码块/列表/H4+/超长行且不污染 journal；9）F09：保留严格主源标题与单表列数校验并明确表头列数与多表报错；10）F10：sync 冲突返回非零退出码 2，子进程错误仅输出分类摘要与 [REDACTED] 绝不回显正文片段。全部 32 项本地 Mock 单元测试（含 9 项独立审计 F01/F03–F10 回归防护与 F02 专项测试）、4 文件编译及 8 项 CLI 冒烟检查均通过；本轮未执行任何真实线上 Notion 或 GitHub 写入。",
   "artifacts": [
     "tools/black9/README.md",
     "tools/black9/consolidate.py",
@@ -22,14 +22,14 @@
     {
       "command": "python3 -B -m unittest discover -s tools/black9 -p 'test_*.py' -v",
       "mode": "local_mocked_mcp",
-      "passed": 23,
+      "passed": 32,
       "failed": 0,
       "exit_code": 0
     },
     {
-      "command": "python3 -B tools/black9/consolidate.py --help && python3 -B tools/black9/consolidate.py build --help && python3 -B tools/black9/sync.py --help && python3 -B tools/black9/deploy.py --help && python3 -B tools/black9/deploy.py prepare --help && python3 -B tools/black9/deploy.py install --help",
+      "command": "python3 -B tools/black9/consolidate.py --help && python3 -B tools/black9/consolidate.py build --help && python3 -B tools/black9/sync.py --help && python3 -B tools/black9/sync.py init --help && python3 -B tools/black9/sync.py sync --help && python3 -B tools/black9/deploy.py --help && python3 -B tools/black9/deploy.py prepare --help && python3 -B tools/black9/deploy.py install --help",
       "mode": "local_cli_smoke",
-      "passed": 6,
+      "passed": 8,
       "failed": 0,
       "exit_code": 0
     }

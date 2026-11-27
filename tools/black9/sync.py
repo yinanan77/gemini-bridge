@@ -64,8 +64,17 @@ class UncertainWriteError(SyncError):
     """Raised when a mutating Notion request was sent but the outcome is uncertain."""
 
 
+class AsyncUpdatePendingError(UncertainWriteError):
+    """Raised when Notion notion-update-page returns an asynchronous task instead of synchronous completion."""
+
+
 class ConflictError(SyncError):
     """Raised or recorded when 3-way sync encounters concurrent local/remote edits."""
+
+
+_SELF_AUTOLINK_RE = re.compile(r"\[(https?://[^\]]+)\]\(\1\)")
+_ANGLE_AUTOLINK_RE = re.compile(r"<(https?://[^>\s]+)>")
+_ESCAPED_MD_PUNCT_RE = re.compile(r"\\([|\[\]])")
 
 
 def utc_now_iso() -> str:
@@ -89,6 +98,8 @@ def canonicalize_markdown(text: str, *, strip_notion_xml: bool = False) -> str:
     - Optionally strips Notion XML wrapper (`<page>...<content>...</content>...</page>`).
     - Normalizes line endings (`\\r\\n`, `\\r` -> `\\n`).
     - Normalizes `<br/>`, `<br />`, `<br>` -> `\\n`.
+    - Normalizes lossless Notion URL autolinks (`[https://...](https://...)` / `<https://...>`)
+      and escaped pipes/brackets (`\\|`, `\\[`, `\\]`) back to plain characters.
     - Strips trailing horizontal whitespace per line.
     - Omits blank lines (matching flat builder output and scripts/notion_sync.py simple renderer).
     """
@@ -97,6 +108,9 @@ def canonicalize_markdown(text: str, *, strip_notion_xml: bool = False) -> str:
         working, _ = consolidate.extract_notion_content_xml(working)
     working = working.replace("\r\n", "\n").replace("\r", "\n")
     working = _BR_TAG_RE.sub("\n", working)
+    working = _SELF_AUTOLINK_RE.sub(r"\1", working)
+    working = _ANGLE_AUTOLINK_RE.sub(r"\1", working)
+    working = _ESCAPED_MD_PUNCT_RE.sub(r"\1", working)
     lines = [line.rstrip(" \t") for line in working.split("\n")]
     non_empty = [line for line in lines if line.strip()]
     return "\n".join(non_empty)
@@ -250,6 +264,7 @@ class FetchedPage:
     raw_text: str
     extracted_body: str
     canonical_body: str
+    had_xml_wrapper: bool = True
 
 
 class MinisMcpNotionClient:
@@ -278,8 +293,12 @@ class MinisMcpNotionClient:
 
         if proc.returncode != 0:
             err_cls = UncertainWriteError if mutating else McpCallError
-            snippet = consolidate.redact_secrets((proc.stderr or proc.stdout or "").strip())[:300]
-            raise err_cls(f"minis-mcp-cli exited with code {proc.returncode}: {snippet}")
+            tool_label = f"minis-mcp-cli {' '.join(args[:3])}"
+            raise err_cls(
+                consolidate.summarize_subprocess_error(
+                    tool_label, proc.returncode, proc.stderr, proc.stdout
+                )
+            )
         return proc.stdout
 
     def discover_schemas(self, *, force: bool = False) -> dict[str, dict[str, Any]]:
@@ -452,6 +471,9 @@ class MinisMcpNotionClient:
                     f"{label}: schema has no recognized content field: {sorted(obj_props.keys())}"
                 )
 
+            if "allow_async" in obj_props:
+                body["allow_async"] = False
+
             _validate_required_fields(obj_schema, body, label)
             return body
 
@@ -459,6 +481,8 @@ class MinisMcpNotionClient:
             payload: dict[str, Any] = {
                 "data": _populate_update_obj(props["data"], "notion-update-page.data")
             }
+            if "allow_async" in props:
+                payload["allow_async"] = False
         else:
             payload = _populate_update_obj(schema, "notion-update-page")
 
@@ -482,7 +506,7 @@ class MinisMcpNotionClient:
         _validate_required_fields(schema, payload, "notion-search")
         return payload
 
-    def fetch_page(self, page_id: str) -> FetchedPage:
+    def fetch_page(self, page_id: str, *, require_xml_wrapper: bool = True) -> FetchedPage:
         clean_id = normalize_notion_id(page_id)
         payload = self._build_fetch_payload(clean_id)
         stdout = self._run_cli(
@@ -493,8 +517,13 @@ class MinisMcpNotionClient:
         if not isinstance(inner, dict) or not isinstance(inner.get("text"), str):
             raise McpCallError("notion-fetch inner payload missing string `text` field")
         raw_text = inner["text"]
-        extracted, _ = consolidate.extract_notion_content_xml(raw_text)
-        canonical = canonicalize_markdown(raw_text, strip_notion_xml=True)
+        extracted, had_wrapper = consolidate.extract_notion_content_xml(raw_text)
+        if require_xml_wrapper and not had_wrapper:
+            raise McpCallError(
+                f"notion-fetch({clean_id}): response missing required Notion <page>/<content> XML wrapper; "
+                "refusing to treat potentially truncated or warning output as page body"
+            )
+        canonical = canonicalize_markdown(extracted, strip_notion_xml=False)
         return FetchedPage(
             page_id=clean_id,
             title=inner.get("title", "") if isinstance(inner.get("title"), str) else "",
@@ -502,14 +531,26 @@ class MinisMcpNotionClient:
             raw_text=raw_text,
             extracted_body=extracted,
             canonical_body=canonical,
+            had_xml_wrapper=had_wrapper,
         )
 
-    def create_page(self, *, parent_id: str, title: str, content: str) -> tuple[str, str]:
+    def create_page(
+        self,
+        *,
+        parent_id: str,
+        title: str,
+        content: str,
+        prepared_payload: dict[str, Any] | None = None,
+    ) -> tuple[str, str]:
         clean_parent = normalize_notion_id(parent_id)
-        payload = self._build_create_page_payload(
-            parent_id=clean_parent,
-            title=title,
-            content=content,
+        payload = (
+            prepared_payload
+            if prepared_payload is not None
+            else self._build_create_page_payload(
+                parent_id=clean_parent,
+                title=title,
+                content=content,
+            )
         )
         stdout = self._run_cli(
             ["call", "Notion", "notion-create-pages", json.dumps(payload, ensure_ascii=False)],
@@ -523,19 +564,45 @@ class MinisMcpNotionClient:
             ) from exc
         return _extract_created_page_id(inner)
 
-    def update_page(self, *, page_id: str, new_content: str) -> None:
+    def update_page(
+        self,
+        *,
+        page_id: str,
+        new_content: str,
+        prepared_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         clean_id = normalize_notion_id(page_id)
-        payload = self._build_update_page_payload(page_id=clean_id, new_content=new_content)
+        payload = (
+            prepared_payload
+            if prepared_payload is not None
+            else self._build_update_page_payload(page_id=clean_id, new_content=new_content)
+        )
         stdout = self._run_cli(
             ["call", "Notion", "notion-update-page", json.dumps(payload, ensure_ascii=False)],
             mutating=True,
         )
         try:
-            _extract_mcp_result_payload(stdout, "notion-update-page")
+            inner = _extract_mcp_result_payload(stdout, "notion-update-page")
         except McpCallError as exc:
             raise UncertainWriteError(
                 f"Uncertain notion-update-page outcome after send: {exc}"
             ) from exc
+
+        if isinstance(inner, dict):
+            async_obj = inner.get("async_task")
+            status_val = str(inner.get("status", "")).lower()
+            if async_obj is not None or status_val in ("in_progress", "pending", "queued", "async"):
+                task_id = ""
+                if isinstance(async_obj, dict) and isinstance(async_obj.get("id"), str):
+                    task_id = async_obj["id"]
+                elif isinstance(inner.get("task_id"), str):
+                    task_id = inner["task_id"]
+                raise AsyncUpdatePendingError(
+                    f"notion-update-page({clean_id}) returned asynchronous task "
+                    f"(task_id={task_id or 'unknown'}); wait for completion and run `sync --recover`"
+                )
+            return inner
+        return {"result": inner}
 
     def search_pages(self, query: str) -> list[dict[str, Any]]:
         payload = self._build_search_payload(query)
@@ -583,24 +650,16 @@ def conflicts_dir_for(state_path: Path) -> Path:
 
 
 def check_state_paths_safety(state_path: Path) -> None:
-    if state_path.is_symlink():
-        raise consolidate.PathSafetyError(f"Refusing symlink state file: {state_path}")
-    if state_path.parent.is_symlink():
-        raise consolidate.PathSafetyError(f"Refusing symlink state directory: {state_path.parent}")
-    jpath = journal_path_for(state_path)
-    if jpath.is_symlink():
-        raise consolidate.PathSafetyError(f"Refusing symlink journal file: {jpath}")
-    cdir = conflicts_dir_for(state_path)
-    if cdir.is_symlink():
-        raise consolidate.PathSafetyError(f"Refusing symlink conflicts directory: {cdir}")
+    consolidate.check_no_symlink_chain(state_path)
+    consolidate.check_no_symlink_chain(journal_path_for(state_path))
+    consolidate.check_no_symlink_chain(conflicts_dir_for(state_path))
 
 
 def load_journal(state_path: Path) -> list[dict[str, Any]]:
     jpath = journal_path_for(state_path)
+    consolidate.check_no_symlink_chain(jpath)
     if not jpath.exists():
         return []
-    if jpath.is_symlink():
-        raise consolidate.PathSafetyError(f"Refusing symlink journal file: {jpath}")
     entries: list[dict[str, Any]] = []
     for lineno, line in enumerate(jpath.read_text(encoding="utf-8").splitlines(), start=1):
         stripped = line.strip()
@@ -629,8 +688,20 @@ def append_journal(state_path: Path, entry: dict[str, Any]) -> None:
     consolidate.atomic_write_bytes(journal_path_for(state_path), payload)
 
 
+_UNRESOLVED_JOURNAL_STATUSES = frozenset(
+    {
+        "send_started",
+        "uncertain",
+        "push_started",
+        "push_uncertain",
+        "push_verify_mismatch",
+        "push_async_pending",
+    }
+)
+
+
 def find_unresolved_journal_ops(entries: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return all journal operations whose latest status is `send_started` or `uncertain`."""
+    """Return all journal operations whose latest status is unresolved/uncertain."""
     latest_by_op: dict[str, dict[str, Any]] = {}
     order: list[str] = []
     for entry in entries:
@@ -644,7 +715,7 @@ def find_unresolved_journal_ops(entries: Sequence[dict[str, Any]]) -> list[dict[
     unresolved: list[dict[str, Any]] = []
     for op_id in order:
         st = latest_by_op[op_id].get("status")
-        if st in ("send_started", "uncertain", "push_started", "push_uncertain", "push_verify_mismatch"):
+        if st in _UNRESOLVED_JOURNAL_STATUSES:
             unresolved.append(latest_by_op[op_id])
     return unresolved
 
@@ -671,9 +742,8 @@ def save_state(state_path: Path, state: dict[str, Any]) -> None:
 
 
 def preflight_bundle_folder(folder: Path) -> dict[str, Any]:
-    """Validate bundle directory, manifest counts (11/335), file hashes, flat format, and symlinks."""
-    if folder.is_symlink():
-        raise consolidate.PathSafetyError(f"Refusing symlink bundle folder: {folder}")
+    """Validate bundle directory, manifest counts (11/335), file hashes, flat format, and full ancestor symlinks."""
+    consolidate.check_no_symlink_chain(folder)
     if not folder.exists() or not folder.is_dir():
         raise SyncError(f"Bundle folder does not exist or is not a directory: {folder}")
 
@@ -819,75 +889,149 @@ def _collection_parent_body(manifest: dict[str, Any], task_marker: str) -> str:
     return "\n".join(blocks) + "\n"
 
 
+_CHILD_PAGE_TAG_RE = re.compile(
+    r'<page\s+[^>]*url="([^"]+)"[^>]*>(.*?)</page>',
+    re.DOTALL,
+)
+
+
+def _format_dashed_uuid(raw_id: str) -> str:
+    clean = raw_id.strip().replace("-", "").lower()
+    if len(clean) == 32 and re.fullmatch(r"[0-9a-f]{32}", clean):
+        return f"{clean[:8]}-{clean[8:12]}-{clean[12:16]}-{clean[16:20]}-{clean[20:32]}"
+    return raw_id.strip()
+
+
+def _extract_child_page_links(parent_raw_text: str) -> list[tuple[str, str, str]]:
+    """Extract direct child `(dashed_page_id, url, title)` tuples from parent `<page>` XML."""
+    children: list[tuple[str, str, str]] = []
+    seen_compact: set[str] = set()
+    body, _ = consolidate.extract_notion_content_xml(parent_raw_text)
+    for m in _CHILD_PAGE_TAG_RE.finditer(body):
+        url = m.group(1).strip()
+        title = m.group(2).strip()
+        id_m = _UUID_EXTRACT_RE.search(url)
+        if not id_m:
+            continue
+        dashed = _format_dashed_uuid(id_m.group(1))
+        compact = dashed.replace("-", "")
+        if compact in seen_compact:
+            continue
+        seen_compact.add(compact)
+        children.append((dashed, url, title))
+    return children
+
+
 def _recover_uncertain_create(
     client: MinisMcpNotionClient,
     *,
     op: dict[str, Any],
     state: dict[str, Any],
 ) -> tuple[str, str] | None:
-    """Explicit recovery lookup via notion-search using unique task marker / title.
+    """Explicit recovery for uncertain page creation with strict parent-child ownership.
 
-    Returns (page_id, url) if uniquely identified, or raises SyncError if ambiguous/unverified.
+    1. First reuses already-persisted `page_id` in `state.json` (zero dependency on `notion-search`).
+    2. For collection parent: verifies direct child of `root_parent_id` and unique `task_marker`.
+    3. For child pages: ONLY accepts actual direct children of `collection_parent_id` with matching title;
+       NEVER falls back to matching arbitrary workspace pages from `notion-search`.
+    Returns `(page_id, url)` if uniquely verified under the expected parent, or `None` if verified absent.
     """
     target = op.get("target")
     marker = op.get("task_marker", "")
     expected_title = op.get("title", "")
 
     if target == "__collection_parent__":
-        matches = client.search_pages(marker)
+        # Priority 1: Reuse persisted collection_parent_id if present.
+        saved_col_id = state.get("collection_parent_id")
+        if isinstance(saved_col_id, str) and saved_col_id.strip():
+            clean_saved = normalize_notion_id(saved_col_id)
+            fetched = client.fetch_page(clean_saved)
+            if not marker or marker in fetched.raw_text or marker in fetched.canonical_body:
+                return clean_saved, fetched.url or str(state.get("collection_parent_url", ""))
+
+        # Priority 2: Inspect direct children of root_parent_id first (works even without notion-search).
+        root_parent_id = state.get("root_parent_id")
         verified: list[tuple[str, str]] = []
-        for m in matches:
-            fetched = client.fetch_page(m["id"])
-            if marker in fetched.raw_text or marker in fetched.canonical_body:
-                verified.append((m["id"], fetched.url or m.get("url", "")))
+        seen_ids: set[str] = set()
+        root_child_compacts: set[str] = set()
+        root_fetched_ok = False
+        if isinstance(root_parent_id, str) and root_parent_id.strip():
+            root_fetched = client.fetch_page(root_parent_id)
+            root_fetched_ok = True
+            for cid, curl, ctitle in _extract_child_page_links(root_fetched.raw_text):
+                compact = cid.replace("-", "").lower()
+                root_child_compacts.add(compact)
+                if expected_title and ctitle and ctitle.strip() != expected_title.strip():
+                    continue
+                fetched = client.fetch_page(cid)
+                if marker in fetched.raw_text or marker in fetched.canonical_body:
+                    if compact not in seen_ids:
+                        seen_ids.add(compact)
+                        verified.append((cid, fetched.url or curl))
+
+        # Priority 3: Optional notion-search by unique task_marker, STILL strictly restricted to root_parent_id children.
+        if not verified and marker and "notion-search" in client.discover_schemas():
+            for m in client.search_pages(marker):
+                pid = _format_dashed_uuid(m["id"])
+                compact = pid.replace("-", "").lower()
+                if root_fetched_ok and compact not in root_child_compacts:
+                    continue
+                fetched = client.fetch_page(pid)
+                if marker in fetched.raw_text or marker in fetched.canonical_body:
+                    if compact not in seen_ids:
+                        seen_ids.add(compact)
+                        verified.append((pid, fetched.url or m.get("url", "")))
+
         if len(verified) == 1:
             return verified[0]
         if len(verified) > 1:
             raise SyncError(
                 f"Recovery found {len(verified)} pages matching collection marker {marker}; manual resolution required"
             )
+        return None
+
+    # Child page recovery:
+    collection_id = state.get("collection_parent_id")
+    if not isinstance(collection_id, str) or not collection_id.strip():
         raise SyncError(
-            f"Recovery could not verify whether collection parent ({marker}) was created; refusing duplicate creation"
+            f"Cannot recover child page {target}: state has no collection_parent_id"
         )
+    clean_col_id = normalize_notion_id(collection_id)
+    parent_fetched = client.fetch_page(clean_col_id)
+    direct_children = _extract_child_page_links(parent_fetched.raw_text)
+    direct_by_compact = {cid.replace("-", "").lower(): (cid, curl, ctitle) for cid, curl, ctitle in direct_children}
 
-    # Child page recovery: search by exact title (or task marker), then verify via parent link or fetched content.
-    search_query = expected_title or marker
-    matches = client.search_pages(search_query)
-    collection_id = state.get("collection_parent_id", "")
-    source_sha = state.get("source_sha256", "")
-    parent_body = ""
-    if collection_id:
-        try:
-            parent_body = client.fetch_page(collection_id).raw_text
-        except McpCallError:
-            parent_body = ""
+    # Priority 1: Reuse already-persisted page_id in state.json (e.g. crash during post-create fetch).
+    pages_map = state.get("pages")
+    if isinstance(pages_map, dict) and isinstance(pages_map.get(target), dict):
+        saved_pid = pages_map[target].get("page_id")
+        if isinstance(saved_pid, str) and saved_pid.strip():
+            clean_saved = normalize_notion_id(saved_pid)
+            compact_saved = clean_saved.replace("-", "").lower()
+            if direct_by_compact and compact_saved not in direct_by_compact:
+                raise SyncError(
+                    f"Persisted page_id {clean_saved} for {target} is not a child of collection parent {clean_col_id}"
+                )
+            fetched = client.fetch_page(clean_saved)
+            return clean_saved, fetched.url or str(pages_map[target].get("url", ""))
 
+    # Priority 2: Strict direct parent-child lookup ONLY (NEVER fall back to arbitrary workspace search matches!).
     verified_children: list[tuple[str, str]] = []
-    for m in matches:
-        pid = m["id"]
-        if expected_title and m.get("title") and m["title"].strip() != expected_title.strip():
+    for cid, curl, ctitle in direct_children:
+        if expected_title and ctitle and ctitle.strip() != expected_title.strip():
             continue
-        compact_id = pid.replace("-", "")
-        if parent_body and (pid in parent_body or compact_id in parent_body):
-            verified_children.append((pid, m.get("url", "")))
+        fetched = client.fetch_page(cid)
+        if expected_title and fetched.title.strip() != expected_title.strip():
             continue
-        fetched = client.fetch_page(pid)
-        title_ok = (not expected_title) or (fetched.title.strip() == expected_title.strip())
-        content_ok = bool(source_sha and source_sha in fetched.raw_text) or bool(
-            marker and marker in fetched.raw_text
-        )
-        if title_ok and content_ok:
-            verified_children.append((pid, fetched.url or m.get("url", "")))
+        verified_children.append((cid, fetched.url or curl))
 
     if len(verified_children) == 1:
         return verified_children[0]
     if len(verified_children) > 1:
         raise SyncError(
-            f"Recovery found {len(verified_children)} matching pages for {target}; manual resolution required"
+            f"Recovery found {len(verified_children)} direct child pages matching {target} under {clean_col_id}; manual resolution required"
         )
-    raise SyncError(
-        f"Recovery could not confirm creation status for {target} ({expected_title}); refusing automatic duplicate creation"
-    )
+    return None
 
 
 def run_init(
@@ -898,6 +1042,7 @@ def run_init(
     client: MinisMcpNotionClient,
     dry_run: bool = False,
     recover: bool = False,
+    allow_recreate_missing: bool = False,
 ) -> dict[str, Any]:
     """Safely initialize ONE collection parent + 13 child pages in Notion."""
     clean_parent = normalize_notion_id(parent_id)
@@ -955,7 +1100,7 @@ def run_init(
         raise UncertainWriteError(
             "Refusing init because unresolved uncertain journal operation(s) exist: "
             + ", ".join(f"{u.get('op_id')}({u.get('target')}:{u.get('status')})" for u in unresolved)
-            + ". Re-run with explicit --recover to search by unique task marker before creating pages."
+            + ". Re-run with explicit --recover to verify parent-child state before creating pages."
         )
 
     state: dict[str, Any] = existing_state or {
@@ -982,10 +1127,30 @@ def run_init(
             op_id = op["op_id"]
             target = op.get("target")
             if op.get("op") != "create_page":
-                raise SyncError(f"Cannot auto-recover non-create operation: {op_id}")
-            recovered_id, recovered_url = _recover_uncertain_create(
-                client, op=op, state=state
-            ) or ("", "")
+                raise SyncError(
+                    f"Cannot recover non-create operation `{op_id}` via `init --recover`; run `sync --recover`"
+                )
+            recovered = _recover_uncertain_create(client, op=op, state=state)
+            if recovered is None:
+                if not allow_recreate_missing:
+                    raise SyncError(
+                        f"Recovery verified {target} ({op.get('title', '')}) was NOT created under expected parent; "
+                        "refusing automatic duplicate creation (pass --allow-recreate-missing to explicitly recreate)"
+                    )
+                append_journal(
+                    state_path,
+                    {
+                        "op_id": op_id,
+                        "op": "create_page",
+                        "target": target,
+                        "task_marker": op.get("task_marker", ""),
+                        "status": "recovered_not_created",
+                    },
+                )
+                recovered_ops.append(op_id)
+                continue
+
+            recovered_id, recovered_url = recovered
             if target == "__collection_parent__":
                 state["collection_parent_id"] = recovered_id
                 state["collection_parent_url"] = recovered_url
@@ -1038,6 +1203,13 @@ def run_init(
     # Step 1: Create ONE collection parent under --parent if not yet created.
     created_parent = False
     if not state.get("collection_parent_id"):
+        parent_body = _collection_parent_body(manifest, task_marker)
+        # Validate create schema & construct payload BEFORE polluting journal (F05).
+        prepared_parent_payload = client._build_create_page_payload(
+            parent_id=clean_parent,
+            title=collection_title,
+            content=parent_body,
+        )
         op_id = f"init:collection_parent:{task_marker}"
         append_journal(
             state_path,
@@ -1055,7 +1227,8 @@ def run_init(
             col_id, col_url = client.create_page(
                 parent_id=clean_parent,
                 title=collection_title,
-                content=_collection_parent_body(manifest, task_marker),
+                content=parent_body,
+                prepared_payload=prepared_parent_payload,
             )
         except UncertainWriteError:
             append_journal(
@@ -1100,6 +1273,12 @@ def run_init(
             skipped_pages.append(doc_id)
             continue
 
+        # Validate create schema & construct payload BEFORE polluting journal (F05).
+        prepared_child_payload = client._build_create_page_payload(
+            parent_id=collection_parent_id,
+            title=doc["title"],
+            content=doc["text"],
+        )
         page_marker = f"{task_marker}:{doc_id}"
         op_id = f"init:page:{doc_id}:{manifest['source_sha256'][:12]}"
         append_journal(
@@ -1119,6 +1298,7 @@ def run_init(
                 parent_id=collection_parent_id,
                 title=doc["title"],
                 content=doc["text"],
+                prepared_payload=prepared_child_payload,
             )
         except UncertainWriteError:
             append_journal(
@@ -1279,6 +1459,117 @@ def _write_conflict_snapshot(
     }
 
 
+def _recover_unresolved_push_ops(
+    *,
+    state_path: Path,
+    state: dict[str, Any],
+    folder: Path,
+    client: MinisMcpNotionClient,
+    unresolved: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Safely reconcile unresolved push journal entries against live Notion state."""
+    pages = state["pages"]
+    recovered: list[dict[str, Any]] = []
+
+    for op in unresolved:
+        op_id = op["op_id"]
+        if op.get("op") != "push":
+            raise SyncError(
+                f"Cannot recover non-push operation `{op_id}` via `sync --recover`; run `init --recover`"
+            )
+        target = op.get("target")
+        if not isinstance(target, str) or target not in pages:
+            raise SyncError(f"Unknown push recovery target in journal: {target}")
+
+        entry = pages[target]
+        fname = entry["filename"]
+        page_id = normalize_notion_id(entry["page_id"])
+        local_path = folder / fname
+        consolidate.check_no_symlink_chain(local_path, stop_at=folder)
+        if not local_path.exists() or not local_path.is_file():
+            raise SyncError(f"Cannot recover push for {target}: local file missing ({local_path})")
+
+        local_raw = local_path.read_text(encoding="utf-8")
+        local_raw_sha = sha256_text(local_raw)
+        local_canon_sha = sha256_text(canonicalize_markdown(local_raw, strip_notion_xml=False))
+
+        fetched = client.fetch_page(page_id)
+        remote_raw_sha = sha256_text(fetched.extracted_body)
+        remote_canon_sha = sha256_text(fetched.canonical_body)
+
+        expected_canon = str(op.get("expected_canon_sha256", ""))
+        base_remote_canon = str(entry.get("base_remote_canon_sha256", ""))
+
+        if remote_canon_sha in (expected_canon, local_canon_sha) and remote_canon_sha == local_canon_sha:
+            # Remote reflects the pushed local content -> confirm and advance baselines.
+            entry["base_local_raw_sha256"] = local_raw_sha
+            entry["base_local_canon_sha256"] = local_canon_sha
+            entry["base_remote_raw_sha256"] = remote_raw_sha
+            entry["base_remote_canon_sha256"] = remote_canon_sha
+            entry["updated_at"] = utc_now_iso()
+            save_state(state_path, state)
+            append_journal(
+                state_path,
+                {
+                    "op_id": op_id,
+                    "op": "push",
+                    "target": target,
+                    "page_id": page_id,
+                    "verified_canon_sha256": remote_canon_sha,
+                    "status": "recovered_push_confirmed",
+                },
+            )
+            recovered.append({"op_id": op_id, "target": target, "outcome": "push_confirmed"})
+        elif base_remote_canon and remote_canon_sha == base_remote_canon:
+            # Remote still matches pre-push baseline -> push did NOT apply; unlock cleanly.
+            append_journal(
+                state_path,
+                {
+                    "op_id": op_id,
+                    "op": "push",
+                    "target": target,
+                    "page_id": page_id,
+                    "remote_canon_sha256": remote_canon_sha,
+                    "status": "recovered_push_not_applied",
+                },
+            )
+            recovered.append({"op_id": op_id, "target": target, "outcome": "push_not_applied"})
+        else:
+            # Remote matches neither expected nor prior baseline (e.g. partial/truncated write or concurrent edit).
+            # Preserve BOTH sides in conflicts/ and unlock journal WITHOUT advancing baseline or overwriting either side.
+            conflict_files = _write_conflict_snapshot(
+                state_path,
+                doc_id=target,
+                page_id=page_id,
+                local_text=local_raw,
+                remote_text=fetched.extracted_body,
+                local_canon_sha=local_canon_sha,
+                remote_canon_sha=remote_canon_sha,
+            )
+            append_journal(
+                state_path,
+                {
+                    "op_id": op_id,
+                    "op": "push",
+                    "target": target,
+                    "page_id": page_id,
+                    "local_canon_sha256": local_canon_sha,
+                    "remote_canon_sha256": remote_canon_sha,
+                    "status": "recovered_conflict_preserved",
+                },
+            )
+            recovered.append(
+                {
+                    "op_id": op_id,
+                    "target": target,
+                    "outcome": "conflict_preserved",
+                    "conflict_files": conflict_files,
+                }
+            )
+
+    return recovered
+
+
 def run_sync(
     *,
     state_path: Path,
@@ -1287,16 +1578,16 @@ def run_sync(
     only: Sequence[str] = (),
     dry_run: bool = False,
     status_only: bool = False,
+    recover: bool = False,
 ) -> dict[str, Any]:
-    """Run conservative 3-way sync (or read-only `--status` / `--dry-run`)."""
+    """Run conservative 3-way sync (or read-only `--status` / `--dry-run`, or explicit `--recover`)."""
     check_state_paths_safety(state_path)
     state = load_state(state_path)
     if state is None:
         raise SyncError(f"State file does not exist: {state_path}. Run `init` first.")
 
     folder = folder_override if folder_override is not None else Path(state["folder"])
-    if folder.is_symlink():
-        raise consolidate.PathSafetyError(f"Refusing symlink folder: {folder}")
+    consolidate.check_no_symlink_chain(folder)
     if not folder.exists() or not folder.is_dir():
         raise SyncError(f"Synced folder does not exist or is not a directory: {folder}")
 
@@ -1308,15 +1599,29 @@ def run_sync(
     unresolved = find_unresolved_journal_ops(journal_entries)
     read_only = dry_run or status_only
 
-    if unresolved and not read_only:
+    if unresolved and not read_only and not recover:
         raise UncertainWriteError(
             "Refusing mutating sync because unresolved journal operation(s) exist: "
             + ", ".join(f"{u.get('op_id')}({u.get('target')}:{u.get('status')})" for u in unresolved)
+            + ". Re-run with explicit `sync --recover` to reconcile against Notion."
         )
 
     # Validate required Notion tools via runtime schema discovery.
     required = ["notion-fetch"] if read_only else ["notion-fetch", "notion-update-page"]
     client.require_tools(required)
+
+    recovered_ops: list[dict[str, Any]] = []
+    recovered_by_target: dict[str, dict[str, Any]] = {}
+    if unresolved and recover and not read_only:
+        recovered_ops = _recover_unresolved_push_ops(
+            state_path=state_path,
+            state=state,
+            folder=folder,
+            client=client,
+            unresolved=unresolved,
+        )
+        recovered_by_target = {r["target"]: r for r in recovered_ops}
+        unresolved = find_unresolved_journal_ops(load_journal(state_path))
 
     target_doc_ids = _parse_only_targets(only, pages)
     results: list[dict[str, Any]] = []
@@ -1333,6 +1638,34 @@ def run_sync(
         entry = pages[doc_id]
         fname = entry["filename"]
         page_id = normalize_notion_id(entry["page_id"])
+        rec_info = recovered_by_target.get(doc_id)
+        if rec_info is not None:
+            outcome = rec_info.get("outcome")
+            if outcome == "conflict_preserved":
+                counts["conflict"] += 1
+                results.append(
+                    {
+                        "doc_id": doc_id,
+                        "filename": fname,
+                        "page_id": page_id,
+                        "action": "conflict",
+                        "applied": False,
+                        "conflict_files": rec_info.get("conflict_files"),
+                    }
+                )
+                continue
+            if outcome == "push_not_applied":
+                results.append(
+                    {
+                        "doc_id": doc_id,
+                        "filename": fname,
+                        "page_id": page_id,
+                        "action": "recovered_not_applied",
+                        "applied": False,
+                        "note": "Remote still matches pre-push baseline; journal unlocked without auto-repush. Run normal sync to retry.",
+                    }
+                )
+                continue
         local_path = folder / fname
         consolidate.check_no_symlink_chain(local_path, stop_at=folder)
 
@@ -1420,6 +1753,14 @@ def run_sync(
 
         if not local_changed and remote_changed:
             # Pull-only: remote edited while local still matches baseline.
+            if not fetched.had_xml_wrapper:
+                raise SyncError(
+                    f"Refusing pull for {doc_id}: remote response lacked Notion <page>/<content> XML wrapper"
+                )
+            if local_canon.strip() and not fetched.canonical_body.strip():
+                raise SyncError(
+                    f"Refusing pull for {doc_id}: remote body unexpectedly became empty while local file is non-empty"
+                )
             counts["pull"] += 1
             if not read_only:
                 pulled_text = fetched.extracted_body.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n") + "\n"
@@ -1463,12 +1804,17 @@ def run_sync(
             # Push-only: protected baseline confirms remote is unchanged.
             counts["push"] += 1
             if not read_only:
-                # Enforce line length safety before pushing to Notion.
-                for lineno, line in enumerate(local_raw.split("\n"), start=1):
-                    if len(line) >= consolidate.HARD_MD_LINE_LIMIT:
-                        raise SyncError(
-                            f"Refusing push for {fname}:{lineno}: line length {len(line)} >= {consolidate.HARD_MD_LINE_LIMIT}"
-                        )
+                # F08: Enforce flat Markdown compatibility (no tables/codeblocks/lists/nested blocks, H1-H3, < 1900 chars/line) BEFORE journaling or pushing.
+                try:
+                    consolidate.validate_flat_markdown(local_raw, fname, allow_blank_lines=True)
+                except consolidate.ConsolidateError as exc:
+                    raise SyncError(f"Refusing non-flat push for {fname}: {exc}") from exc
+
+                # F05: Validate update schema & construct payload BEFORE writing push_started to journal.
+                prepared_update_payload = client._build_update_page_payload(
+                    page_id=page_id, new_content=local_raw
+                )
+
                 op_id = f"sync:push:{doc_id}:{local_canon_sha[:12]}"
                 append_journal(
                     state_path,
@@ -1482,7 +1828,24 @@ def run_sync(
                     },
                 )
                 try:
-                    client.update_page(page_id=page_id, new_content=local_raw)
+                    client.update_page(
+                        page_id=page_id,
+                        new_content=local_raw,
+                        prepared_payload=prepared_update_payload,
+                    )
+                except AsyncUpdatePendingError:
+                    append_journal(
+                        state_path,
+                        {
+                            "op_id": op_id,
+                            "op": "push",
+                            "target": doc_id,
+                            "page_id": page_id,
+                            "expected_canon_sha256": local_canon_sha,
+                            "status": "push_async_pending",
+                        },
+                    )
+                    raise
                 except UncertainWriteError:
                     append_journal(
                         state_path,
@@ -1594,6 +1957,7 @@ def run_sync(
         "state_path": str(state_path),
         "folder": str(folder),
         "unresolved_journal_ops": len(unresolved),
+        "recovered_ops": recovered_ops,
         "summary": counts,
         "pages": results,
     }
@@ -1637,7 +2001,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     init_p.add_argument(
         "--recover",
         action="store_true",
-        help="Explicitly search by unique task marker to recover from an uncertain send.",
+        help="Explicitly verify parent-child ownership / persisted page_id to recover from an uncertain send.",
+    )
+    init_p.add_argument(
+        "--allow-recreate-missing",
+        action="store_true",
+        help="Only with --recover: allow recreating a page verified absent under its expected parent.",
     )
 
     sync_p = sub.add_parser(
@@ -1667,6 +2036,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Read-only status check comparing local, remote, and baseline.",
     )
+    sync_p.add_argument(
+        "--recover",
+        action="store_true",
+        help="Reconcile unresolved push journal entries against live Notion state safely.",
+    )
 
     status_p = sub.add_parser(
         "status",
@@ -1688,8 +2062,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "inspect":
             report = client.inspect_relevant_schemas()
             if args.output is not None:
-                if args.output.is_symlink():
-                    raise consolidate.PathSafetyError(f"Refusing symlink output: {args.output}")
+                consolidate.check_no_symlink_chain(args.output)
                 data = (
                     json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
                 ).encode("utf-8")
@@ -1702,6 +2075,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 client=client,
                 dry_run=args.dry_run,
                 recover=args.recover,
+                allow_recreate_missing=args.allow_recreate_missing,
             )
         elif args.command == "sync":
             report = run_sync(
@@ -1711,6 +2085,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 only=args.only,
                 dry_run=args.dry_run,
                 status_only=args.status,
+                recover=args.recover,
             )
         elif args.command == "status":
             report = run_sync(
@@ -1730,6 +2105,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     print(json.dumps(report, ensure_ascii=False, indent=2))
+    if report.get("status") == "conflict":
+        return 2
     return 0
 
 

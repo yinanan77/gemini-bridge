@@ -12,12 +12,13 @@ import contextlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from unittest import mock
 
 _THIS_DIR = Path(__file__).resolve().parent
@@ -493,11 +494,101 @@ def standard_notion_tools_schema() -> dict[str, Any]:
     }
 
 
+OLD_PARENT_ID = "22222222-3333-4444-8555-666666666666"
+
+
+def runtime_flat_notion_tools_schema(
+    *, allow_async_required: bool = False, include_search: bool = True
+) -> dict[str, Any]:
+    """Runtime-accurate flat Notion MCP schema (matching live `minis-mcp-cli tools Notion`)."""
+    update_required = ["page_id", "command", "new_str"]
+    if allow_async_required:
+        update_required.append("allow_async")
+    tools: list[dict[str, Any]] = [
+        {
+            "name": "notion-fetch",
+            "description": "Fetch a Notion page by ID",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+            },
+        },
+        {
+            "name": "notion-create-pages",
+            "description": "Create Notion pages under parent",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "parent": {
+                        "type": "object",
+                        "properties": {"page_id": {"type": "string"}},
+                        "required": ["page_id"],
+                    },
+                    "pages": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "properties": {"type": "object"},
+                                "content": {"type": "string"},
+                            },
+                            "required": ["properties", "content"],
+                        },
+                    },
+                },
+                "required": ["pages"],
+            },
+        },
+        {
+            "name": "notion-update-page",
+            "description": "Update Notion page content (flat schema with allow_async)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "page_id": {"type": "string"},
+                    "command": {
+                        "type": "string",
+                        "enum": ["update_properties", "replace_content", "update_content"],
+                    },
+                    "new_str": {"type": "string"},
+                    "allow_async": {"type": "boolean"},
+                },
+                "required": update_required,
+            },
+        },
+    ]
+    if include_search:
+        tools.append(
+            {
+                "name": "notion-search",
+                "description": "Search Notion workspace",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            }
+        )
+    return {"tools": tools}
+
+
 class MockNotionServer:
     """In-memory fake Notion MCP server driven via mocked `subprocess.run`."""
 
-    def __init__(self, *, tools_schema: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        tools_schema: dict[str, Any] | None = None,
+        autolink_urls_on_fetch: bool = False,
+        return_async_task_on_update: bool = False,
+        fail_fetch_after_create_id: bool = False,
+        extra_roots: Sequence[str] = (),
+    ) -> None:
         self.tools_schema = tools_schema or standard_notion_tools_schema()
+        self.autolink_urls_on_fetch = autolink_urls_on_fetch
+        self.return_async_task_on_update = return_async_task_on_update
+        self.fail_fetch_after_create_id = fail_fetch_after_create_id
         self.pages: dict[str, dict[str, Any]] = {
             ROOT_PARENT_ID: {
                 "id": ROOT_PARENT_ID,
@@ -505,16 +596,28 @@ class MockNotionServer:
                 "title": "Existing User Root Page",
                 "content": "# Root\n\nExisting user content.",
                 "url": f"https://www.notion.so/{ROOT_PARENT_ID.replace('-', '')}",
-            }
+            },
         }
+        for rid in extra_roots:
+            self.pages[rid] = {
+                "id": rid,
+                "parent_id": None,
+                "title": f"Extra Root {rid[:8]}",
+                "content": "# Extra Root\n\nArchive.",
+                "url": f"https://www.notion.so/{rid.replace('-', '')}",
+            }
         self._seq = 1
         self.calls: list[tuple[str, dict[str, Any] | None]] = []
         self.create_call_count = 0
         self.update_call_count = 0
+        self.create_payloads: list[dict[str, Any]] = []
+        self.update_payloads: list[dict[str, Any]] = []
         # Failure injection hooks
         self.uncertain_on_create_index: int | None = None
         self.uncertain_mode: str = "malformed_after_create"  # or "timeout_after_create"
+        self.fail_create_before_remote_at: int | None = None
         self.truncate_on_next_update: bool = False
+        self.timeout_on_next_update: bool = False
         self.next_fetch_raw_override: dict[str, str] = {}
 
     def _next_id(self) -> str:
@@ -541,6 +644,8 @@ class MockNotionServer:
         # Include child links in parent XML just like real Notion fetch.
         children = [p for p in self.pages.values() if p.get("parent_id") == page["id"]]
         body = page["content"]
+        if self.autolink_urls_on_fetch:
+            body = re.sub(r"(?<!\()(?<!\[)(https://[^\s)>\]]+)", r"[\1](\1)", body)
         if children:
             child_tags = "\n".join(
                 f'<page url="{c["url"]}">{c["title"]}</page>' for c in children
@@ -567,6 +672,13 @@ class MockNotionServer:
 
             if tool_name == "notion-fetch":
                 pid = payload.get("id") or payload.get("page_id")
+                if (
+                    self.fail_fetch_after_create_id
+                    and self.create_call_count >= 2
+                    and pid not in (ROOT_PARENT_ID, OLD_PARENT_ID)
+                ):
+                    self.fail_fetch_after_create_id = False
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="Transient 503 on fetch")
                 if pid not in self.pages:
                     return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="Page not found")
                 page = self.pages[pid]
@@ -584,6 +696,13 @@ class MockNotionServer:
 
             if tool_name == "notion-create-pages":
                 self.create_call_count += 1
+                self.create_payloads.append(payload)
+                if (
+                    self.fail_create_before_remote_at is not None
+                    and self.create_call_count == self.fail_create_before_remote_at
+                ):
+                    self.fail_create_before_remote_at = None
+                    raise subprocess.TimeoutExpired(cmd=cmd, timeout=60)
                 parent_id = payload["parent"]["page_id"]
                 page_spec = payload["pages"][0]
                 title = page_spec["properties"]["title"]
@@ -616,9 +735,23 @@ class MockNotionServer:
 
             if tool_name == "notion-update-page":
                 self.update_call_count += 1
-                data = payload["data"]
+                self.update_payloads.append(payload)
+                data = payload["data"] if isinstance(payload.get("data"), dict) else payload
                 pid = data["page_id"]
                 new_str = data["new_str"]
+                if self.timeout_on_next_update:
+                    self.timeout_on_next_update = False
+                    raise subprocess.TimeoutExpired(cmd=cmd, timeout=60)
+                if self.return_async_task_on_update:
+                    self.return_async_task_on_update = False
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        0,
+                        stdout=self._wrap_mcp(
+                            {"async_task": {"id": "async-task-98765", "status": "in_progress"}}
+                        ),
+                        stderr="",
+                    )
                 if self.truncate_on_next_update:
                     self.truncate_on_next_update = False
                     new_str = new_str[:80]
@@ -1365,14 +1498,22 @@ class Black9SyncTests(unittest.TestCase):
             c03_state_before["base_local_canon_sha256"],
             c03_state_after["base_local_canon_sha256"],
         )
-        # Clear the test-induced unresolved push_verify_mismatch journal entry to test conflict next
-        sync.append_journal(
-            self.state_path,
-            {
-                "op_id": sync.find_unresolved_journal_ops(sync.load_journal(self.state_path))[0]["op_id"],
-                "status": "manually_resolved_in_test",
-            },
-        )
+        # Recover the push_verify_mismatch using real `sync --recover` (F05):
+        # preserves truncated remote & local in conflicts/ without advancing baseline, and unlocks journal!
+        with mock.patch("subprocess.run", side_effect=server.subprocess_run):
+            rec_res = sync.run_sync(
+                state_path=self.state_path, client=client, only=["C03"], recover=True
+            )
+        self.assertEqual(rec_res["status"], "conflict")
+        self.assertEqual(len(rec_res["recovered_ops"]), 1)
+        self.assertEqual(rec_res["recovered_ops"][0]["outcome"], "conflict_preserved")
+        self.assertEqual(rec_res["unresolved_journal_ops"], 0)
+        # Clean up C03 conflict snapshot directory so step 5 can cleanly verify dry-run writes nothing to conflicts/
+        c03_conf_dir = sync.conflicts_dir_for(self.state_path)
+        if c03_conf_dir.exists():
+            import shutil
+
+            shutil.rmtree(c03_conf_dir)
 
         # 5. Conflict (both local and remote changed differently)
         c04_path = self.bundle_dir / "04_C04.md"
@@ -1970,6 +2111,537 @@ class Black9DeployTests(unittest.TestCase):
         self.assertNotIn(USER_SCRIPT_NOISE, logs)
         self.assertNotIn("secret_gh_XYZ123", logs)
         self.assertIn("[REDACTED]", logs)
+
+
+class Black9AuditRegressionTests(unittest.TestCase):
+    """Regression protection suite verifying every independent audit finding (F01-F10) is FIXED."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._tmp.name)
+        self.source_file = self.tmp_path / "source_analysis.md"
+        self.source_file.write_text(build_synthetic_source_markdown(), encoding="utf-8")
+        self.vault_dir = self.tmp_path / "vault"
+        self.vault_dir.mkdir()
+        build_report = consolidate.build_bundle(
+            source_path=self.source_file,
+            output_dir=self.vault_dir,
+            source_urls=["https://www.notion.so/source-audit-doc"],
+        )
+        self.bundle_dir = Path(build_report["bundle_dir"])
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_f01_update_page_explicit_allow_async_false_and_async_task_handling(self) -> None:
+        """[F01] Flat runtime notion-update-page explicitly sends allow_async=False; async_task is detected and recovered safely."""
+        # Part A: Schema with optional allow_async AND schema with required allow_async both send allow_async=False.
+        for allow_async_req in (False, True):
+            server = MockNotionServer(
+                tools_schema=runtime_flat_notion_tools_schema(allow_async_required=allow_async_req)
+            )
+            client = sync.MinisMcpNotionClient()
+            state_path = self.tmp_path / f"state_f01_{allow_async_req}" / "state.json"
+            with mock.patch("subprocess.run", side_effect=server.subprocess_run):
+                sync.run_init(
+                    folder=self.bundle_dir,
+                    parent_id=ROOT_PARENT_ID,
+                    state_path=state_path,
+                    client=client,
+                )
+                c01_path = self.bundle_dir / "01_C01.md"
+                orig_c01 = c01_path.read_text(encoding="utf-8")
+                c01_path.write_text(orig_c01 + f"\nF01同步校验_{allow_async_req}。\n", encoding="utf-8")
+                res = sync.run_sync(state_path=state_path, client=client, only=["C01"])
+                c01_path.write_text(orig_c01, encoding="utf-8")
+
+            self.assertEqual(res["summary"]["push"], 1)
+            self.assertEqual(len(server.update_payloads), 1)
+            self.assertIn("allow_async", server.update_payloads[0])
+            self.assertIs(server.update_payloads[0]["allow_async"], False)
+
+        # Part B: If Notion still returns {"async_task": ...}, raise AsyncUpdatePendingError,
+        # journal push_async_pending (NOT push_verify_mismatch), block normal sync, and recover cleanly via sync --recover!
+        server_async = MockNotionServer(
+            tools_schema=runtime_flat_notion_tools_schema(),
+            return_async_task_on_update=True,
+        )
+        client_async = sync.MinisMcpNotionClient()
+        state_async = self.tmp_path / "state_f01_async" / "state.json"
+        with mock.patch("subprocess.run", side_effect=server_async.subprocess_run):
+            sync.run_init(
+                folder=self.bundle_dir,
+                parent_id=ROOT_PARENT_ID,
+                state_path=state_async,
+                client=client_async,
+            )
+            c02_id = json.loads(state_async.read_text(encoding="utf-8"))["pages"]["C02"]["page_id"]
+            c02_path = self.bundle_dir / "02_C02.md"
+            updated_c02 = c02_path.read_text(encoding="utf-8") + "\n异步任务测试段落。\n"
+            c02_path.write_text(updated_c02, encoding="utf-8")
+
+            with self.assertRaises(sync.AsyncUpdatePendingError):
+                sync.run_sync(state_path=state_async, client=client_async, only=["C02"])
+
+            unresolved = sync.find_unresolved_journal_ops(sync.load_journal(state_async))
+            self.assertEqual(len(unresolved), 1)
+            self.assertEqual(unresolved[0]["status"], "push_async_pending")
+
+            # Normal mutating sync refuses until explicit recovery.
+            with self.assertRaises(sync.UncertainWriteError):
+                sync.run_sync(state_path=state_async, client=client_async, only=["C02"])
+
+            # Simulate Notion finishing the async task in the background, then run `sync --recover`.
+            server_async.pages[c02_id]["content"] = updated_c02
+            rec = sync.run_sync(
+                state_path=state_async, client=client_async, only=["C02"], recover=True
+            )
+            self.assertEqual(rec["status"], "ok")
+            self.assertEqual(rec["unresolved_journal_ops"], 0)
+            self.assertEqual(rec["recovered_ops"][0]["outcome"], "push_confirmed")
+            self.assertEqual(rec["summary"]["noop"], 1)
+
+    def test_f03_ancestor_symlink_escape_rejected_across_consolidate_sync_deploy(self) -> None:
+        """[F03] Symlinked ancestor directories are rejected across consolidate, sync, and deploy with ZERO outside writes."""
+        outside = self.tmp_path / "outside_target"
+        outside.mkdir()
+        link_dir = self.tmp_path / "link_dir"
+        link_dir.symlink_to(outside)
+
+        real_src_dir = self.tmp_path / "real_src_dir"
+        real_src_dir.mkdir()
+        (real_src_dir / "s.md").write_text(self.source_file.read_text(encoding="utf-8"), encoding="utf-8")
+        link_src_dir = self.tmp_path / "link_src_dir"
+        link_src_dir.symlink_to(real_src_dir)
+
+        # 1. consolidate.build_bundle rejects symlinked ancestor on source AND output
+        with self.assertRaises(consolidate.PathSafetyError):
+            consolidate.build_bundle(source_path=link_src_dir / "s.md", output_dir=self.tmp_path / "out_ok")
+        with self.assertRaises(consolidate.PathSafetyError):
+            consolidate.build_bundle(source_path=self.source_file, output_dir=link_dir / "nested_out")
+
+        # 2. consolidate.fetch_notion_page rejects symlinked ancestor output
+        server = MockNotionServer()
+        with mock.patch("subprocess.run", side_effect=server.subprocess_run):
+            with self.assertRaises(consolidate.PathSafetyError):
+                consolidate.fetch_notion_page(ROOT_PARENT_ID, link_dir / "nested" / "fetched.md")
+
+        # 3. sync.run_init rejects symlinked ancestor state path
+        with mock.patch("subprocess.run", side_effect=server.subprocess_run):
+            with self.assertRaises(consolidate.PathSafetyError):
+                sync.run_init(
+                    folder=self.bundle_dir,
+                    parent_id=ROOT_PARENT_ID,
+                    state_path=link_dir / "nested" / "black9_state.json",
+                    client=sync.MinisMcpNotionClient(),
+                )
+        self.assertEqual(server.create_call_count, 0)
+
+        # 4. sync.main inspect --output rejects symlinked ancestor
+        with mock.patch("subprocess.run", side_effect=server.subprocess_run):
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf):
+                rc = sync.main(["inspect", "--output", str(link_dir / "nested" / "schemas.json")])
+        self.assertEqual(rc, 1)
+
+        # 5. deploy.run_install and deploy.run_prepare reject symlinked ancestor vault / out
+        with self.assertRaises(consolidate.PathSafetyError):
+            deploy.run_install(bundle_dir=self.bundle_dir, vault_dir=link_dir / "nested_vault")
+        with self.assertRaises(consolidate.PathSafetyError):
+            deploy.run_prepare(
+                bundle_dir=self.bundle_dir,
+                sync_state_path=self.tmp_path / "nonexistent_state.json",
+                vault_dir=self.vault_dir,
+                out_dir=link_dir / "nested_prepare",
+                github_client=deploy.MinisMcpGitHubClient(),
+                notion_client=sync.MinisMcpNotionClient(),
+            )
+
+        # ZERO files or directories created inside outside_target!
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_f04_recover_strict_parent_child_no_hijack_and_saved_page_id_without_search(self) -> None:
+        """[F04] init --recover enforces strict parent-child ownership (never hijacks another parent's page) and prioritizes saved page_id."""
+        # Scenario A: Earlier collection exists under OLD_PARENT_ID; new init under ROOT_PARENT_ID
+        # times out BEFORE creating C01 remotely.
+        server = MockNotionServer(
+            tools_schema=runtime_flat_notion_tools_schema(),
+            extra_roots=[OLD_PARENT_ID],
+        )
+        client = sync.MinisMcpNotionClient()
+        old_state = self.tmp_path / "old_state" / "state.json"
+        prod_state = self.tmp_path / "prod_state" / "state.json"
+
+        with mock.patch("subprocess.run", side_effect=server.subprocess_run):
+            sync.run_init(
+                folder=self.bundle_dir,
+                parent_id=OLD_PARENT_ID,
+                state_path=old_state,
+                client=client,
+            )
+            old_c01_id = json.loads(old_state.read_text(encoding="utf-8"))["pages"]["C01"]["page_id"]
+
+            # 3rd create call (1=collection parent, 2=00_index, 3=C01) times out BEFORE Notion creates C01.
+            server.create_call_count = 0
+            server.fail_create_before_remote_at = 3
+            with self.assertRaises(sync.UncertainWriteError):
+                sync.run_init(
+                    folder=self.bundle_dir,
+                    parent_id=ROOT_PARENT_ID,
+                    state_path=prod_state,
+                    client=client,
+                )
+
+            # Default `init --recover` MUST NOT hijack old_c01_id from OLD_PARENT_ID, and refuses auto-recreate without opt-in!
+            with self.assertRaises(sync.SyncError) as ctx_no_recreate:
+                sync.run_init(
+                    folder=self.bundle_dir,
+                    parent_id=ROOT_PARENT_ID,
+                    state_path=prod_state,
+                    client=client,
+                    recover=True,
+                )
+            self.assertIn("--allow-recreate-missing", str(ctx_no_recreate.exception))
+
+            # Explicit `--recover --allow-recreate-missing` creates a fresh C01 under ROOT_PARENT_ID's collection parent!
+            rec = sync.run_init(
+                folder=self.bundle_dir,
+                parent_id=ROOT_PARENT_ID,
+                state_path=prod_state,
+                client=client,
+                recover=True,
+                allow_recreate_missing=True,
+            )
+            self.assertEqual(rec["status"], "ok")
+            prod_data = json.loads(prod_state.read_text(encoding="utf-8"))
+            prod_c01_id = prod_data["pages"]["C01"]["page_id"]
+            self.assertNotEqual(prod_c01_id, old_c01_id)
+            self.assertEqual(
+                server.pages[prod_c01_id]["parent_id"], prod_data["collection_parent_id"]
+            )
+
+        # Scenario B: Post-create fetch_page fails transiently AFTER page_id is persisted in state.json,
+        # AND notion-search is completely absent from schema -> `--recover` MUST succeed using saved page_id!
+        server_b = MockNotionServer(
+            tools_schema=runtime_flat_notion_tools_schema(include_search=False),
+            fail_fetch_after_create_id=True,
+        )
+        client_b = sync.MinisMcpNotionClient()
+        state_b = self.tmp_path / "state_f04_b" / "state.json"
+        with mock.patch("subprocess.run", side_effect=server_b.subprocess_run):
+            with self.assertRaises(sync.McpCallError):
+                sync.run_init(
+                    folder=self.bundle_dir,
+                    parent_id=ROOT_PARENT_ID,
+                    state_path=state_b,
+                    client=client_b,
+                )
+            st_mid = json.loads(state_b.read_text(encoding="utf-8"))
+            saved_index_id = st_mid["pages"]["00_index"]["page_id"]
+            self.assertTrue(saved_index_id)
+
+            rec_b = sync.run_init(
+                folder=self.bundle_dir,
+                parent_id=ROOT_PARENT_ID,
+                state_path=state_b,
+                client=client_b,
+                recover=True,
+            )
+            self.assertEqual(rec_b["status"], "ok")
+            self.assertEqual(rec_b["total_tracked_pages"], 13)
+            st_after = json.loads(state_b.read_text(encoding="utf-8"))
+            self.assertEqual(st_after["pages"]["00_index"]["page_id"], saved_index_id)
+            self.assertTrue(st_after["pages"]["00_index"]["base_remote_canon_sha256"])
+            # Zero duplicate pages created (1 collection + 13 children = 14)
+            self.assertEqual(server_b.create_call_count, 14)
+
+    def test_f05_notion_autolink_canonical_match_schema_preflight_and_sync_recover_outcomes(self) -> None:
+        """[F05] Notion URL autolinking passes post-push verify; SchemaValidationError never poisons journal; sync --recover handles all 3 outcomes."""
+        # Part A: Notion read-back autolinks bare URLs as [url](url) -> post-push verify MUST succeed!
+        server = MockNotionServer(
+            tools_schema=runtime_flat_notion_tools_schema(),
+            autolink_urls_on_fetch=True,
+        )
+        client = sync.MinisMcpNotionClient()
+        state_path = self.tmp_path / "state_f05_auto" / "state.json"
+        with mock.patch("subprocess.run", side_effect=server.subprocess_run):
+            sync.run_init(
+                folder=self.bundle_dir,
+                parent_id=ROOT_PARENT_ID,
+                state_path=state_path,
+                client=client,
+            )
+            c01_path = self.bundle_dir / "01_C01.md"
+            orig_c01_bytes = c01_path.read_bytes()
+            c01_path.write_text(
+                c01_path.read_text(encoding="utf-8") + "\n正常校对备注（含自动链接兼容）。\n",
+                encoding="utf-8",
+            )
+            push_res = sync.run_sync(state_path=state_path, client=client, only=["C01"])
+            self.assertEqual(push_res["status"], "ok")
+            self.assertEqual(push_res["summary"]["push"], 1)
+            self.assertEqual(sync.find_unresolved_journal_ops(sync.load_journal(state_path)), [])
+
+            # Also test `sync --recover` push_not_applied outcome (timeout BEFORE remote write)
+            c02_path = self.bundle_dir / "02_C02.md"
+            orig_c02_bytes = c02_path.read_bytes()
+            c02_path.write_text(
+                c02_path.read_text(encoding="utf-8") + "\n推送超时未落库测试。\n",
+                encoding="utf-8",
+            )
+            server.timeout_on_next_update = True
+            with self.assertRaises(sync.UncertainWriteError):
+                sync.run_sync(state_path=state_path, client=client, only=["C02"])
+            updates_before_rec = server.update_call_count
+            rec_not_applied = sync.run_sync(
+                state_path=state_path, client=client, only=["C02"], recover=True
+            )
+            self.assertEqual(rec_not_applied["status"], "ok")
+            self.assertEqual(rec_not_applied["unresolved_journal_ops"], 0)
+            self.assertEqual(rec_not_applied["recovered_ops"][0]["outcome"], "push_not_applied")
+            # No surprise automatic re-push during --recover
+            self.assertEqual(server.update_call_count, updates_before_rec)
+            # Subsequent normal sync pushes cleanly!
+            retry_push = sync.run_sync(state_path=state_path, client=client, only=["C02"])
+            self.assertEqual(retry_push["summary"]["push"], 1)
+            # Restore original bundle bytes before Part B preflight init tests
+            c01_path.write_bytes(orig_c01_bytes)
+            c02_path.write_bytes(orig_c02_bytes)
+
+        # Part B: SchemaValidationError during init OR sync MUST leave ZERO send_started / push_started in journal!
+        bad_create_schema = runtime_flat_notion_tools_schema()
+        for t in bad_create_schema["tools"]:
+            if t["name"] == "notion-create-pages":
+                t["inputSchema"] = {
+                    "type": "object",
+                    "properties": {"unexpected_only": {"type": "string"}},
+                    "required": ["unexpected_only"],
+                }
+        bad_server = MockNotionServer(tools_schema=bad_create_schema)
+        state_bad_create = self.tmp_path / "state_f05_bad_create" / "state.json"
+        with mock.patch("subprocess.run", side_effect=bad_server.subprocess_run):
+            with self.assertRaises(sync.SchemaValidationError):
+                sync.run_init(
+                    folder=self.bundle_dir,
+                    parent_id=ROOT_PARENT_ID,
+                    state_path=state_bad_create,
+                    client=sync.MinisMcpNotionClient(),
+                )
+        self.assertEqual(bad_server.create_call_count, 0)
+        self.assertEqual(sync.find_unresolved_journal_ops(sync.load_journal(state_bad_create)), [])
+
+        # Also verify SchemaValidationError during sync push leaves ZERO push_started in journal!
+        bad_update_schema = runtime_flat_notion_tools_schema()
+        for t in bad_update_schema["tools"]:
+            if t["name"] == "notion-update-page":
+                t["inputSchema"] = {
+                    "type": "object",
+                    "properties": {"unknown_req": {"type": "string"}},
+                    "required": ["unknown_req"],
+                }
+        server_bad_upd = MockNotionServer(tools_schema=bad_update_schema)
+        client_bad_upd = sync.MinisMcpNotionClient()
+        state_bad_upd = self.tmp_path / "state_f05_bad_upd" / "state.json"
+        with mock.patch("subprocess.run", side_effect=server_bad_upd.subprocess_run):
+            sync.run_init(
+                folder=self.bundle_dir,
+                parent_id=ROOT_PARENT_ID,
+                state_path=state_bad_upd,
+                client=client_bad_upd,
+            )
+            c03_path = self.bundle_dir / "03_C03.md"
+            c03_path.write_text(c03_path.read_text(encoding="utf-8") + "\n模式错误前检查。\n", encoding="utf-8")
+            with self.assertRaises(sync.SchemaValidationError):
+                sync.run_sync(state_path=state_bad_upd, client=client_bad_upd, only=["C03"])
+        self.assertEqual(server_bad_upd.update_call_count, 0)
+        self.assertEqual(sync.find_unresolved_journal_ops(sync.load_journal(state_bad_upd)), [])
+
+    def test_f06_xml_literal_content_self_close_preserved_and_unwrapped_or_empty_pull_refused(self) -> None:
+        """[F06] Literal <content/> in body does NOT wipe page; unwrapped warnings and sudden empty remote body refuse pull."""
+        # Part A: Literal <content/> inside valid <content>...</content> preserves full body!
+        raw_with_literal = (
+            '<page url="https://www.notion.so/x">\n'
+            '<properties>{"title":"C01"}</properties>\n'
+            "<content>\n# C01\n\n注意不要误用空标签 <content/> 在正文中。\n</content>\n</page>"
+        )
+        extracted, had_wrapper = consolidate.extract_notion_content_xml(raw_with_literal)
+        self.assertTrue(had_wrapper)
+        self.assertIn("注意不要误用空标签 <content/> 在正文中。", extracted)
+
+        # Standalone empty <content/> with no paired <content>...</content> still returns ("", True)
+        raw_empty = (
+            '<page url="https://www.notion.so/empty">\n'
+            '<properties>{"title":"Empty"}</properties>\n'
+            "<content/>\n</page>"
+        )
+        empty_body, empty_wrap = consolidate.extract_notion_content_xml(raw_empty)
+        self.assertEqual(empty_body, "")
+        self.assertTrue(empty_wrap)
+
+        # Part B: Unwrapped non-XML warning text is rejected by fetch_page and MUST NOT overwrite local file!
+        server = MockNotionServer(tools_schema=runtime_flat_notion_tools_schema())
+        client = sync.MinisMcpNotionClient()
+        state_path = self.tmp_path / "state_f06" / "state.json"
+        with mock.patch("subprocess.run", side_effect=server.subprocess_run):
+            sync.run_init(
+                folder=self.bundle_dir,
+                parent_id=ROOT_PARENT_ID,
+                state_path=state_path,
+                client=client,
+            )
+            c02_id = json.loads(state_path.read_text(encoding="utf-8"))["pages"]["C02"]["page_id"]
+            c02_path = self.bundle_dir / "02_C02.md"
+            orig_c02_bytes = c02_path.read_bytes()
+
+            server.next_fetch_raw_override[c02_id] = "Warning: page temporarily truncated by upstream gateway"
+            with self.assertRaises(sync.McpCallError):
+                sync.run_sync(state_path=state_path, client=client, only=["C02"])
+            self.assertEqual(c02_path.read_bytes(), orig_c02_bytes)
+
+            # Part C: Sudden empty wrapped <content/> on remote MUST NOT wipe non-empty local file!
+            server.next_fetch_raw_override[c02_id] = (
+                f'<page url="https://www.notion.so/{c02_id.replace("-", "")}">\n'
+                '<properties>{"title":"C02"}</properties>\n<content/>\n</page>'
+            )
+            with self.assertRaises(sync.SyncError):
+                sync.run_sync(state_path=state_path, client=client, only=["C02"])
+            self.assertEqual(c02_path.read_bytes(), orig_c02_bytes)
+
+    def test_f07_audit_visual_and_ambiguous_samples_never_classified_as_unverified_text(self) -> None:
+        """[F07] Visually ambiguous and pure visual cells from audit are never labeled source_text_unverified."""
+        samples = [
+            "画面展示产品对比",
+            "[特写镜头，推近]",
+            "（纯动作演示，未说话）",
+            "【片头LOGO】",
+        ]
+        for s in samples:
+            cls = consolidate.classify_original_cell(s)
+            self.assertIn(
+                cls,
+                ("visual_or_non_spoken", "mixed_visual_and_text"),
+                f"Expected visual/mixed classification for {s!r}, got {cls!r}",
+            )
+
+    def test_f08_sync_push_rejects_non_flat_markdown_before_journal_or_update(self) -> None:
+        """[F08] sync push invokes validate_flat_markdown and blocks tables/codeblocks/lists/H4+/long lines BEFORE journaling or updating Notion."""
+        server = MockNotionServer(tools_schema=runtime_flat_notion_tools_schema())
+        client = sync.MinisMcpNotionClient()
+        state_path = self.tmp_path / "state_f08" / "state.json"
+        with mock.patch("subprocess.run", side_effect=server.subprocess_run):
+            sync.run_init(
+                folder=self.bundle_dir,
+                parent_id=ROOT_PARENT_ID,
+                state_path=state_path,
+                client=client,
+            )
+            c03_path = self.bundle_dir / "03_C03.md"
+            base_c03 = c03_path.read_text(encoding="utf-8")
+            bad_additions = [
+                "\n| Col1 | Col2 |\n| --- | --- |\n| A | B |\n",
+                "\n```python\nprint(1)\n```\n",
+                "\n- 无序列表项\n",
+                "\n#### 不支持的四级标题\n",
+                "\n" + ("长" * 1950) + "\n",
+            ]
+            for addition in bad_additions:
+                c03_path.write_text(base_c03 + addition, encoding="utf-8")
+                with self.assertRaises(sync.SyncError):
+                    sync.run_sync(state_path=state_path, client=client, only=["C03"])
+            self.assertEqual(server.update_call_count, 0)
+            self.assertEqual(sync.find_unresolved_journal_ops(sync.load_journal(state_path)), [])
+
+    def test_f09_strict_heading_column_and_duplicate_table_validation_explicit(self) -> None:
+        """[F09] Strict parser explicitly rejects wrong header column count and duplicate tables per case."""
+        # 5-column header rejected immediately with explicit header error
+        five_col_lines = [
+            "| A | B | C | D | E |",
+            "| --- | --- | --- | --- | --- |",
+            "| 1 | 2 | 3 | 4 | 5 |",
+        ]
+        with self.assertRaises(consolidate.SourceParseError) as ctx_5:
+            consolidate.parse_case_table(five_col_lines, "C01")
+        self.assertIn("expected 4 table columns in header", str(ctx_5.exception))
+
+        # Multiple tables inside a single Appendix B case rejected explicitly
+        dup_table_lines = [
+            "| 序号／时间 | 原文 | 逐句分析 | 语义组 |",
+            "| --- | --- | --- | --- |",
+            "| 1 · 00:00 | 甲 | 析1 | 组1 |",
+            "",
+            "| 序号／时间 | 原文 | 逐句分析 | 语义组 |",
+            "| --- | --- | --- | --- |",
+            "| 2 · 00:02 | 乙 | 析2 | 组2 |",
+        ]
+        with self.assertRaises(consolidate.SourceParseError) as ctx_dup:
+            consolidate.parse_case_table(dup_table_lines, "C01")
+        self.assertIn("found multiple", str(ctx_dup.exception))
+
+        # 8-column Appendix A table rejected immediately in header check
+        eight_col_app_a = [
+            "| 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+            "| a | b | c | d | e | f | g | h |",
+        ]
+        with self.assertRaises(consolidate.SourceParseError) as ctx_a:
+            consolidate.parse_appendix_a_case_table(eight_col_app_a, "C01")
+        self.assertIn("expected 7 table columns in header", str(ctx_a.exception))
+
+    def test_f10_conflict_cli_nonzero_exit_and_subprocess_errors_never_echo_body(self) -> None:
+        """[F10] sync CLI returns exit code 2 on conflict; subprocess errors never echo private body snippets."""
+        server = MockNotionServer(tools_schema=runtime_flat_notion_tools_schema())
+        state_path = self.tmp_path / "state_f10" / "state.json"
+        init_buf = io.StringIO()
+        with mock.patch("subprocess.run", side_effect=server.subprocess_run):
+            with contextlib.redirect_stdout(init_buf):
+                rc_init = sync.main(
+                    [
+                        "init",
+                        "--folder",
+                        str(self.bundle_dir),
+                        "--parent",
+                        ROOT_PARENT_ID,
+                        "--state",
+                        str(state_path),
+                    ]
+                )
+            self.assertEqual(rc_init, 0)
+
+            c04_id = json.loads(state_path.read_text(encoding="utf-8"))["pages"]["C04"]["page_id"]
+            c04_path = self.bundle_dir / "04_C04.md"
+            c04_path.write_text(c04_path.read_text(encoding="utf-8") + "\n本地冲突行。\n", encoding="utf-8")
+            server.pages[c04_id]["content"] += "\n\n远端冲突行。"
+
+            sync_buf = io.StringIO()
+            with contextlib.redirect_stdout(sync_buf):
+                rc_sync = sync.main(["sync", "--state", str(state_path), "--only", "C04"])
+
+        parsed = json.loads(sync_buf.getvalue())
+        self.assertEqual(parsed["status"], "conflict")
+        self.assertEqual(rc_sync, 2)  # Non-zero exit code on conflict!
+
+        # Subprocess failure echoing private body + token MUST leak ZERO characters of either!
+        def leaking_body_cli(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(
+                cmd,
+                1,
+                stdout=f"Echoed request body: {PRIVATE_SENTINEL}",
+                stderr=f"401 Unauthorized Bearer secret_body_leak_999 body={PRIVATE_SENTINEL}",
+            )
+
+        with mock.patch("subprocess.run", side_effect=leaking_body_cli):
+            with self.assertRaises(sync.McpCallError) as ctx_sync_err:
+                sync.MinisMcpNotionClient().discover_schemas()
+            with self.assertRaises(consolidate.McpFetchError) as ctx_fetch_err:
+                consolidate.fetch_notion_page(ROOT_PARENT_ID, self.tmp_path / "f10_out.md")
+            with self.assertRaises(sync.McpCallError) as ctx_dep_err:
+                deploy.MinisMcpGitHubClient().discover_schemas()
+
+        for err in (ctx_sync_err.exception, ctx_fetch_err.exception, ctx_dep_err.exception):
+            msg = str(err)
+            self.assertNotIn(PRIVATE_SENTINEL, msg)
+            self.assertNotIn("secret_body_leak_999", msg)
+            self.assertIn("[REDACTED]", msg)
 
 
 if __name__ == "__main__":
