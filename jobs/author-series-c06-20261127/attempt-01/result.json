@@ -1,0 +1,32 @@
+{
+  "task_id": "author-series-c06-20261127",
+  "attempt": 1,
+  "contract_sha256": "31de9279ec0096060ab1a9b43da8cf226b49eafa939024a4c343e6bbb952ddaa",
+  "status": "completed",
+  "summary": "在桥接仓作业分支完成三份授权候选文件：1) AUTHOR_SERIES_INDEX.md（1386汉字台账，非创作框架）按A/B/C/D四组整理黑桃约会系列6条文本候选（沿用原库归属、非官方编号、非作者全核）、思远单列用户已确认的C06（不另编S号）及原注册S01-S11、黑桃其他非约会案例C01-C05与七原稿03-07（原库未复核）、以及C06/C09待复核与历史22/11/15口径冻结边界；2) registry.json在输入底稿上做最小增量补丁，仅在顶层新增author_series_inventory与author_attribution_correction、更新updated_on为2026-11-27、追加revision_history并保留旧历史，仅修改C06与C09的group为各自id并保留legacy_group=C06-C09与relation_status=旧同人成品关联待复核，仅在C06写入思远用户确认与exclude_from_black9=true，未为C09及余下20条新增作者确认，完整保留全部22条样本id/description/evidence_level与其余顶层字段；3) CHANGES.md记录字段级diff、依据、推导限制与原库保留范围，明示未写入Obsidian/Notion。注：下述自测仅校验JSON合法性、字段级差异与文档结构，不以字符或脚本检查替代原片作者事实核验。",
+  "artifacts": [
+    "author-series-20261127/AUTHOR_SERIES_INDEX.md",
+    "author-series-20261127/CHANGES.md",
+    "author-series-20261127/registry.json"
+  ],
+  "tests": [
+    {
+      "command": "python3 -m json.tool author-series-20261127/registry.json > /dev/null",
+      "passed": 1,
+      "failed": 0,
+      "scope": "验证 author-series-20261127/registry.json 为合法 JSON"
+    },
+    {
+      "command": "diff -u inputs/author-series-20261127/registry.json author-series-20261127/registry.json",
+      "passed": 1,
+      "failed": 0,
+      "scope": "逐行核对 registry.json 相对输入的最小增量差异，确认仅改动指定顶层字段、C06、C09、updated_on 与 revision_history 追加项"
+    },
+    {
+      "command": "python3 unittest (TestAuthorSeriesDeliverables: test_01..test_08)",
+      "passed": 8,
+      "failed": 0,
+      "scope": "自动化字段差异与结构不变量校验：顶层键集合与未改顶层字段逐字保留、revision_history 追加且旧历史未删、22条样本顺序及 id/description/evidence_level 不变、其余20条零改动、C06 精确写入思远/用户确认/exclude_from_black9=true/series/legacy_group/relation_status、C09 仅拆 group 并留 legacy_group 与 relation_status 且无伪造作者确认、三份产出齐全且台账 1386 汉字含 A/B/C/D 四组；仅用于数据与字段完整性校验，不作为原片作者事实核验"
+    }
+  ]
+}

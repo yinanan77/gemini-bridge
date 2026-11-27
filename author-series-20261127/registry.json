@@ -1,0 +1,496 @@
+{
+  "version": "current",
+  "entrypoint": "C端内容/创作系统/C端统一创作系统.md",
+  "notion_entrypoint": "https://app.notion.com/p/3ff7e10be9a38194be36dc7437286ea1",
+  "author_series_inventory": "C端内容/创作系统/作者归属与系列索引.md",
+  "author_attribution_correction": "2026-11-27 11:38用户原话确认：C06（1000070192.mp4西装长版，开头‘经常约会的朋友们都应该知道…’）作者为思远而非黑桃，已排除出黑桃作者统计；旧库C06编号、‘黑桃11版本’标题及C06-C09旧分组均不构成作者归属证明。本轮未对C09及其他样本新增原片作者核验，也不因C06更正而否定C06与C09的旧同人成品关联。",
+  "required_entry_markers": [
+    "按写作任务调用的八类依据",
+    "全篇信息怎样接力",
+    "从已拍素材到文稿",
+    "主题提炼由助手承担",
+    "本对话分析的应用范围",
+    "新增参考与反馈怎样迭代",
+    "验证登记与执行责任",
+    "表达校准与参考比较的具体用法",
+    "验收与验证的实际边界"
+  ],
+  "sources": [
+    {
+      "path": "C端内容/创作系统/C端统一创作系统.md",
+      "status": "current_rules",
+      "approved": false,
+      "sha256": "45c47f76011bb1af2e501aab7d486da9be50fb1c4057e03a9cd2305c9914a825",
+      "notion_id": "3ff7e10b-e9a3-8194-be36-dc7437286ea1"
+    },
+    {
+      "path": "C端内容/创作系统/黑桃9与思远_22版本_段落措辞与衔接补研究_2026-11-04.md",
+      "status": "research",
+      "approved": false,
+      "sha256": "9735b57816342b5c5df53e0691261e3c5ed134b15bdbe38cb83a35e6445d6d14",
+      "notion_id": "40e7e10be9a381669665db3c5fcc61f6"
+    },
+    {
+      "path": "C端内容/创作系统/黑桃11版本_跨案例复核证据与检验_2026-11-01.md",
+      "status": "research",
+      "approved": false,
+      "sha256": "1c1383dfee9a77aeadf91cce519dc5a14ac029072a1516293f18588105c25ed2",
+      "notion_id": "40b7e10be9a381a7b8fbc57e0da6c24c"
+    },
+    {
+      "path": "C端内容/创作系统/黑桃9_第10与11条_逐句画面与逻辑分析_2026-10-29.md",
+      "status": "research",
+      "approved": false,
+      "sha256": "146c8691625a4a5cdd1611a9ba4e19c3dc0b5d98fd38764384c042d72042a1d4",
+      "notion_id": "4087e10be9a38145bdf3dedda3bade2c"
+    },
+    {
+      "path": "C端内容/成品文稿/害羞男生_浅金发形象改造_最终定稿.md",
+      "status": "approved",
+      "approved": true,
+      "sha256": "791c822e6a38cecd9bfba05c71448e1d15f094661d4851dc55b73b06d188957d",
+      "notion_id": "3fe7e10b-e9a3-81d0-8448-d86d82118247"
+    },
+    {
+      "path": "C端内容/成品文稿/乖巧男生_慵懒卷发改造_最终定稿_2026-10-23.md",
+      "status": "approved",
+      "approved": true,
+      "sha256": "8af3597544324aa29ae622cdc45feea5ed34457e211c249b11936aaea20b72e8",
+      "notion_id": "4017e10b-e9a3-8162-8863-c4a2b17510d1"
+    },
+    {
+      "path": "C端内容/成品文稿/小轩_斯文败类_最终定稿与成片复盘_2026-10-31.md",
+      "status": "approved",
+      "approved": true,
+      "sha256": "24e610023e80eecf6e7dabc2babd1143d29a1505944ae13e8ff473839635b320",
+      "notion_id": "40b7e10be9a381c0b562f1b73f6a6ee5"
+    },
+    {
+      "path": "C端内容/候选文稿/新案例_完整文稿_候选_2026-11-07.md",
+      "status": "candidate",
+      "approved": false,
+      "sha256": "87de277ca7ba03d9df6a47a4ebb4f129c0433379d50b158a84280d6b51bcfaa8",
+      "notion_id": null
+    }
+  ],
+  "sample_registry": [
+    {
+      "id": "C01",
+      "description": "金角｜让被忽略的服务者成为主角；1000066867.mp4",
+      "evidence_level": "已有校订阅读稿与历史音画记录",
+      "group": "C01"
+    },
+    {
+      "id": "C02",
+      "description": "攒钱毕业生｜代价与选择权；1000069734(2).mp4",
+      "evidence_level": "已有校订阅读稿与历史音画记录",
+      "group": "C02"
+    },
+    {
+      "id": "C03",
+      "description": "留长发青年｜先诊断愿望与困扰的冲突；1000070178.mp4",
+      "evidence_level": "已有校订阅读稿与历史音画记录",
+      "group": "C03"
+    },
+    {
+      "id": "C04",
+      "description": "自然卷毕业生｜重新界定改变的尺度；1000070182.mp4",
+      "evidence_level": "已有校订阅读稿与历史音画记录",
+      "group": "C04"
+    },
+    {
+      "id": "C05",
+      "description": "阿坤｜经历两次进入，但承担不同任务；1000070184.mp4",
+      "evidence_level": "已有校订阅读稿与历史音画记录",
+      "group": "C05"
+    },
+    {
+      "id": "C06",
+      "description": "西装长版｜有把握的条件与受阻的执行；1000070192.mp4",
+      "evidence_level": "已有校订阅读稿与历史音画记录",
+      "group": "C06",
+      "legacy_group": "C06-C09",
+      "relation_status": "旧同人成品关联待复核",
+      "author": "思远",
+      "author_status": "用户确认",
+      "author_evidence": "2026-11-27 11:38用户原话",
+      "exclude_from_black9": true,
+      "series": "约会题材相关长版(是否系列未核)"
+    },
+    {
+      "id": "C07",
+      "description": "浅金豹纹｜整体段的每个连接词各有对象；1000070202(1).mp4",
+      "evidence_level": "已有校订阅读稿与历史音画记录",
+      "group": "C07"
+    },
+    {
+      "id": "C08",
+      "description": "蓝衬衫马甲｜动作列举之后靠关系句合拢；1000070459.mp4",
+      "evidence_level": "已有校订阅读稿与历史音画记录",
+      "group": "C08"
+    },
+    {
+      "id": "C09",
+      "description": "西装短版｜程度词把正式与随意连在一起；1000070460.mp4",
+      "evidence_level": "已有校订阅读稿与历史音画记录",
+      "group": "C09",
+      "legacy_group": "C06-C09",
+      "relation_status": "旧同人成品关联待复核"
+    },
+    {
+      "id": "C10",
+      "description": "浅金黑框｜先建立视觉关系，再命名人物感觉；play(2).mp4",
+      "evidence_level": "已有全片可见字幕功能研究",
+      "group": "C10"
+    },
+    {
+      "id": "C11",
+      "description": "黑发卷发｜空隙是眉眼收益的中间桥梁；play(7).mp4",
+      "evidence_level": "已有全片可见字幕功能研究",
+      "group": "C11"
+    },
+    {
+      "id": "S01",
+      "description": "中年西装｜心愿在中段才具体化；7647794499964529014",
+      "evidence_level": "已存逐秒画面补核＋字幕短引；完整原声未核",
+      "group": "S01"
+    },
+    {
+      "id": "S02",
+      "description": "最高爱意／YSL｜关照通过选择和行动进入；7636593198156852726",
+      "evidence_level": "已存逐秒画面补核＋字幕短引；非连续听写",
+      "group": "S02"
+    },
+    {
+      "id": "S03",
+      "description": "约会穿搭（5）｜阶段结果生成下一种需要；7619581892576618980，123.563秒",
+      "evidence_level": "播放器约3—6秒采样记录；无完整媒体与连续原句",
+      "group": "S03"
+    },
+    {
+      "id": "S04",
+      "description": "Oliver｜同一优势也造成结构限制；7590602482239275206，88.960秒",
+      "evidence_level": "播放器采样＋可见字幕短引；无连续复听",
+      "group": "S04"
+    },
+    {
+      "id": "S05",
+      "description": "贾斯丁｜风险问题与答案同属结构任务；7565417115886538020，约66.16秒",
+      "evidence_level": "播放器采样＋字幕短引；平台标题不是开场原句",
+      "group": "S05"
+    },
+    {
+      "id": "S06",
+      "description": "灰裤三套｜角色生成后才进入装忙表演；play(1).mp4，83.43秒",
+      "evidence_level": "已存密集抽帧及字幕校读；已有ASR索引，非逐字听准",
+      "group": "S06"
+    },
+    {
+      "id": "S07",
+      "description": "温义飞｜身份限制改动幅度，细节改变观察尺度；play(3).mp4，92.25秒",
+      "evidence_level": "已存密集画面、字幕校读与ASR疑词；非原声终审",
+      "group": "S07"
+    },
+    {
+      "id": "S08",
+      "description": "运动型客户｜从动时有力量到静止也成立；play(4).mp4，77.00秒",
+      "evidence_level": "已存密集画面、字幕摘要与机器转写索引",
+      "group": "S08"
+    },
+    {
+      "id": "S09",
+      "description": "黑色多轮约会｜边界演示与分支选择；play(5).mp4，97.73秒",
+      "evidence_level": "已存密集画面、字幕摘要与ASR索引",
+      "group": "S09"
+    },
+    {
+      "id": "S10",
+      "description": "山治cosplay｜目标角色提供可比较的尺度；play(6).mp4，88.40秒",
+      "evidence_level": "已存密集画面和字幕校读；部分工艺ASR待核",
+      "group": "S10"
+    },
+    {
+      "id": "S11",
+      "description": "强风格客户／普林黑红｜懂行的人要求差异而非推翻；区别于S02",
+      "evidence_level": "已存密集画面、字幕摘要和ASR疑段",
+      "group": "S11"
+    }
+  ],
+  "workflow": [
+    "读取现行入口与本期素材母稿",
+    "提炼实际变化并比较表达方向",
+    "按任务读取相关连续来源与核验状态",
+    "分配全篇新增信息并写完整稿",
+    "检查事实、全文、段落与措辞",
+    "按用户反馈局部修订并保留版本"
+  ],
+  "boundaries": [
+    "资料校验通过不等于实际看过素材",
+    "研究不等于作者自述或因果验证",
+    "本轮未重新听审全部原片",
+    "用户确认才是定稿",
+    "未来对话需要实际读取入口，不宣称后台自动加载"
+  ],
+  "revision_history": [
+    {
+      "previous_label": "CEND-2026-11-08-r2",
+      "note": "修订编号为同一文件的历史状态，不代表并列框架；从本次起入口只显示更新日期。"
+    },
+    {
+      "date": "2026-11-27",
+      "note": "依据2026-11-27 11:38用户原话，将C06（1000070192.mp4西装长版）作者更正为思远并排除出黑桃作者统计；将C06与C09的活跃group拆分为各自id并保留legacy_group=C06-C09及relation_status=旧同人成品关联待复核；顶层新增author_series_inventory与author_attribution_correction，其余顶层字段与22条样本的id/description/evidence_level保持不变。"
+    }
+  ],
+  "updated_on": "2026-11-27",
+  "execution_records": {
+    "purpose": "将本轮讨论分成明确分工、试行方法、假设及结果验证；不构成新框架或创作效果证明。",
+    "items": [
+      {
+        "id": "U01",
+        "status": "confirmed_workflow",
+        "source": "用户：我先拍摄，然后发给你你给我产出文稿，然后我再剪辑。",
+        "action": "按已拍素材开始，助手交完整文稿。"
+      },
+      {
+        "id": "U02",
+        "status": "confirmed_responsibility",
+        "source": "用户：我没有想表达的变化，我想让你找。",
+        "action": "助手负责发现变化、比较方向并选择主线。"
+      },
+      {
+        "id": "U03",
+        "status": "confirmed_goal",
+        "source": "用户：不是接近哪两三期，他的整体框架是我需要的。",
+        "action": "跨期比较共通作用与选择条件，保持统一系统。"
+      },
+      {
+        "id": "M01",
+        "status": "trial_method",
+        "source": "本轮助手提出；用户授权应用到数据库，不等于效果认可。",
+        "action": "事实变化、视觉关系、人物感受、方向取舍、信息分配、成稿检查。",
+        "validation": "实际新稿、用户具体修改与前后版本对照。",
+        "outcome": "not_tested"
+      },
+      {
+        "id": "Q01",
+        "status": "required_check",
+        "source": "本轮讨论；11月4日已有全篇信息分配依据。",
+        "action": "比较全文信息增量、任务及观察尺度，防止逐句有作用但整体重复。",
+        "outcome": "pending_actual_draft"
+      },
+      {
+        "id": "I01",
+        "status": "trial_iteration_method",
+        "source": "本轮讨论，与既有跨案例研究相连。",
+        "action": "新实现补证据；新条件补范围；反例修规则；证据不足待验证。",
+        "outcome": "not_tested"
+      },
+      {
+        "id": "H01",
+        "status": "hypothesis",
+        "claim": "主题提炼不足是当前最大差距。",
+        "source": "助手解释，非用户事实或实测结论。",
+        "validation": "实际新案例对照，区分执行遗漏与方法不足。",
+        "outcome": "unverified"
+      },
+      {
+        "id": "V01",
+        "status": "outcomes_to_validate",
+        "targets": [
+          "用户认可文稿",
+          "观看表现",
+          "本地咨询预约成交"
+        ],
+        "outcome": "unverified"
+      }
+    ],
+    "case_runs": [
+      {
+        "case_id": "2026-11-08_黑发_浅色连帽卫衣",
+        "recorded_on": "2026-11-09",
+        "status": "opening_confirmed_body_candidate",
+        "user_confirmed_facts": [
+          "半年前烫过",
+          "发根扁塌",
+          "头型比较尖",
+          "烫过卷度堆在两侧显头大",
+          "本次钢夹加气垫增加发根蓬松，并使发尾向后且有空间感"
+        ],
+        "material_files": [
+          "IMG_0735(1).mp4",
+          "IMG_0750(1).mp4",
+          "IMG_0758.mp4",
+          "IMG_0762.mp4",
+          "IMG_0777.mp4",
+          "IMG_0786.mp4",
+          "IMG_0790(1).mp4",
+          "IMG_0795(1).mp4",
+          "IMG_0801.mp4"
+        ],
+        "actual_inspection": "前八段按1.5秒或3秒间隔抽帧，另核重点近景；新增0762按1秒抽帧。未连续听审全部音轨，不冒称逐帧完整核验。",
+        "rule_source": "C端内容/创作系统/C端统一创作系统.md",
+        "reference_scope": [
+          "22版本补研究C03：从具体困扰到保留与流向",
+          "C08：部位选择需要合成完整轮廓关系",
+          "C11：形状、空隙与人物感受之间的桥梁",
+          "本人慵懒卷发确认稿及具体负面反馈"
+        ],
+        "independent_content_choice": "卷度仍在而支撑和体积的分布失衡；从发根补支撑，再把两侧堆积的卷度转为向后流向。成品以卫衣和自然表情呈现随意少年感。",
+        "correction_from_previous_observation": "上一轮只看部分画面，不能以看见起伏推断发根不塌；用户明确事实优先。",
+        "paragraph_progression": [
+          "卷仍在却显萎的观看问题",
+          "半年前卷度与新生发根的关系",
+          "尖头型需要饱满过渡",
+          "发根支撑与发尾后向空间",
+          "卫衣和人物状态形成整体结果"
+        ],
+        "checks": [
+          "无虚构客户诉求、履历、发色或未确认剪裁",
+          "蓬松有部位分工，不把两侧继续外扩当方案",
+          "成品段不重述钢夹气垫工序",
+          "删除说教式尾句，收在人身上的感觉"
+        ],
+        "draft": "【开头展示教资】\n\n来了啊，\n整点发型改造案例啊。\n\n愿意看，看，\n不愿意看，看点别的。\n\n今天的主人公，\n是抖音上私信我的一位老客。\n\n他半年前烫过一次头发。\n新长出来的发根贴着头皮，\n烫过的卷度又堆在两侧，\n整个轮廓就显得又宽又重。\n\n他头型又比较尖，\n这次要调整的，\n是蓬松的位置。\n\n用钢夹配合气垫，\n把支撑重新做到发根，\n让顶部的起伏\n顺着两边过渡，\n轮廓先饱满起来。\n\n发尾再往后带开，\n把堆在脸边的卷度舒展开，\n中间留出一点空间。\n\n这样头发有了起伏，\n也有了往后的方向，\n眉眼露出来，\n长度还在，\n却不再一团团挤在两边。\n\n【成品】\n\n上衣换成浅色的连帽卫衣，\n柔软的领口，\n配上宽松的肩袖，\n把头发里的随意\n延续到整个人身上。\n\n站着有点漫不经心，\n笑起来又很有少年气。",
+        "creative_outcome": "awaiting_user_feedback",
+        "published_metrics": null,
+        "revisions": [
+          {
+            "recorded_on": "2026-11-09",
+            "prior_draft": "【开头展示教资】\n\n今天依旧整点男士发型分析案例啊。\n\n这位男嘉宾，\n头发没少，\n精气神倒是先没了。\n\n半年前烫的卷还留着，\n新长出来的发根却撑不住。\n两侧的卷度堆在一起，\n整个轮廓就显得又宽又重。\n\n他头型又比较尖，\n这次要调整的，\n是蓬松的位置。\n\n用钢夹配合气垫，\n把支撑重新做到发根，\n让顶部的起伏\n顺着两边过渡，\n轮廓先饱满起来。\n\n发尾再往后带开，\n把堆在脸边的卷度舒展开，\n中间留出一点空间。\n\n这样头发有了起伏，\n也有了往后的方向，\n眉眼露出来，\n长度还在，\n却不再一团团挤在两边。\n\n【成品】\n\n上衣换成浅色的连帽卫衣，\n柔软的领口，\n配上宽松的肩袖，\n把头发里的随意\n延续到整个人身上。\n\n站着有点漫不经心，\n笑起来又很有少年气。",
+            "reason": "用户确认系列开场与老客介绍，要求改善与正文承接，并明确不喜欢‘精气神倒是先没了’。",
+            "change_scope": "只调整主人公介绍到原貌诊断的连接；其余保持。"
+          }
+        ],
+        "approved_segments": [
+          {
+            "text": "【开头展示教资】\n\n来了啊，\n整点发型改造案例啊。\n\n愿意看，看，\n不愿意看，看点别的。\n\n今天的主人公，\n是抖音上私信我的一位老客。",
+            "source": "用户：那现在开头可以确定了。",
+            "scope": "系列招呼与主人公关系介绍；不扩大为整稿认可。"
+          }
+        ],
+        "user_feedback": [
+          {
+            "feedback": "很不喜欢‘精气神倒是先没了’这类话；开头与下面内容不衔接。",
+            "application": "用烫发时间、发根与两侧卷度的具体变化承接，不用同义戏谑替换。",
+            "status": "revised_awaiting_user_review"
+          }
+        ]
+      }
+    ],
+    "reference_iterations": [],
+    "governance_changes": [
+      {
+        "date": "2026-11-08",
+        "from": "CEND-2026-11-08-r1",
+        "to": "CEND-2026-11-08-r2",
+        "reason": "用户要求落实截图所列全部分析的数据库应用；补逐项身份、实际动作、反馈迭代及验证记录。",
+        "creative_validation_performed": false
+      },
+      {
+        "date": "2026-11-08",
+        "action": "对照整个对话归并16个主题，取消入口修订编号展示，合并额外验证记录文件。",
+        "creative_validation_performed": false
+      }
+    ],
+    "storage": "本记录已从单独文件合并至原调用清单，不作为第二套框架。"
+  },
+  "conversation_coverage": [
+    {
+      "id": "A01",
+      "topic": "工作分工与主题责任",
+      "application": "易成先拍摄；助手找变化、选择主线并交稿；易成剪辑，不要求用户先定主题或填表",
+      "status_and_boundary": "用户明确，立即执行"
+    },
+    {
+      "id": "A02",
+      "topic": "学习目标与跨期精准",
+      "application": "研究黑桃面对不同人物如何选择信息、控制尺度与收尾；思远研究继续共同支撑同一系统",
+      "status_and_boundary": "不选择两三期套用；“每期更精准”是用户感受与研究方向，不冒充已验证趋势"
+    },
+    {
+      "id": "A03",
+      "topic": "内容、推进、设计、表达、整体五层",
+      "application": "分别检查方向是否聚焦、信息是否连续、取舍有无依据、语言是否自然、人物结果是否成立",
+      "status_and_boundary": "能解释功能不等于表达好；实际稿反馈决定是否符合审美"
+    },
+    {
+      "id": "A04",
+      "topic": "样本与来源底稿",
+      "application": "记录原片/版本、去重组、核验层级、人物条件、文字与画面分工、认可范围及数据时间",
+      "status_and_boundary": "同人成品长短版不算两次独立改造；不重复已有核验工作"
+    },
+    {
+      "id": "A05",
+      "topic": "逐句与语义研究",
+      "application": "完整语义合读，记录读前认识、本句变化、位置措辞、承接、删换损失与画面贡献",
+      "status_and_boundary": "自然连接、有限节奏重复可以成立，不要求每句反转或一句一镜"
+    },
+    {
+      "id": "A06",
+      "topic": "跨案例提炼",
+      "application": "按承担任务比较，分清共通机制、条件性策略与单片实现；保留成立条件和反例",
+      "status_and_boundary": "常见不等于有效；旧片可含缺点，不能强行解释为范本"
+    },
+    {
+      "id": "A07",
+      "topic": "从机制到写作选择",
+      "application": "写前明确本人条件、待解决任务、选择与限制、下一层认识；比较方向后组织全文",
+      "status_and_boundary": "防止先凭惯性写稿，再用功能标签替稿子辩护"
+    },
+    {
+      "id": "A08",
+      "topic": "表达风格与修改对照",
+      "application": "结合本人认可片段、同位置改前改后和具体反馈，比较信息选择、措辞、口语节奏、幽默力度与情绪落点",
+      "status_and_boundary": "分清片段与整稿认可；不靠禁词、分行或固定金句频率代替语感"
+    },
+    {
+      "id": "A09",
+      "topic": "素材到主题",
+      "application": "实际变化→视觉关系→人物感受→内容价值→方向取舍；按本期证据选择最值得讲的变化",
+      "status_and_boundary": "助手提出的试行细化，效果待新稿验证"
+    },
+    {
+      "id": "A10",
+      "topic": "文稿组织与成品",
+      "application": "人物信息、专业判断、预告与成品共同推进任务；解释元素关系，并如实分配发型、穿搭、动作与摄影贡献",
+      "status_and_boundary": "不要求每期故事、约会、反差或行为化结尾；关键判断按需展开"
+    },
+    {
+      "id": "A11",
+      "topic": "全文与表达检查",
+      "application": "从全文、段落到相邻句，检查重复、对象、因果、兑现、替换与删除损失；参考认可稿和失败例",
+      "status_and_boundary": "事实范围问题先纠正；自检不能代替用户认可，也不是独立审核或实测实验"
+    },
+    {
+      "id": "A12",
+      "topic": "新稿与框架验证",
+      "application": "用新人物条件检验选择能否迁移；区分回溯检查、真正留出样本和实际新稿；比较初稿与用户修改",
+      "status_and_boundary": "已经接触的历史资料不称盲测；不凭自评分宣布稳定"
+    },
+    {
+      "id": "A13",
+      "topic": "新参考及反馈迭代",
+      "application": "具体实现补证据、新条件补范围、反例修机制、证据不足列待验证；局部反馈局部处理并检查退步",
+      "status_and_boundary": "不每期追加一套模板，不将全部对话判断升级为硬规则"
+    },
+    {
+      "id": "A14",
+      "topic": "资料调用与持久维护",
+      "application": "只有原统一入口是创作规则主入口；调用清单管理来源、状态和验证记录；确认稿、候选、研究与历史资料各守身份",
+      "status_and_boundary": "同名不等于同内容；实际读取才能说调用，保存不等于自动加载"
+    },
+    {
+      "id": "A15",
+      "topic": "文稿认可、观看与获客",
+      "application": "分别记录实际稿反馈、同口径观看表现及本地咨询预约成交；曲线用于定位待查点",
+      "status_and_boundary": "三类结果分别验证，不从一条数据断言某句造成流失"
+    },
+    {
+      "id": "A16",
+      "topic": "已查明问题与尚待证实归因",
+      "application": "保留两端不同步、旧导航与调用遗漏的实际证据；撤回“数据库没有生成依据”等过度判断",
+      "status_and_boundary": "“主题提炼不足是最大差距”仍为假设；不得用研究数量证明产出质量"
+    }
+  ],
+  "last_execution_record_on": "2026-11-09"
+}
