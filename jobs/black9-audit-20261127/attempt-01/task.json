@@ -1,0 +1,23 @@
+{
+  "acceptance": [
+    "Independent execution of baseline tests plus targeted probes with real output",
+    "Findings tied to exact developer commit, code locations and repro evidence",
+    "No private source reads, credentials, external write, production modifications or model/billing changes",
+    "Clear distinction mocked tests versus live deployment and user-goal coverage"
+  ],
+  "allowed_write_paths": [
+    "reviews/black9-20261127/AUDIT.md",
+    "reviews/black9-20261127/audit.json",
+    "reviews/black9-20261127/test_independent.py"
+  ],
+  "attempt": 1,
+  "base_branch": "main",
+  "contract_sha256": "58981cc28c7061f2df8b67c2b12651d6dd21ea618b30bd5e61462153b666c6b8",
+  "goal": "Independent read-only audit of production toolkit at commit 37aac5aac646cd679f10e0a430a6bb8e1841408f in gpt-gemini/jobs/black9-consolidate-20261127: tools/black9/consolidate.py, sync.py, test_black9.py, README.md. Fetch exact dev commit and inspect code/tests. DO NOT modify developer branch/code. User original goal: consolidate all eleven Black9 complete scripts+analysis into dedicated Obsidian folder mirrored to Notion, verify safe actual two-way sync, preserve originals; no new services/fees/config changes. User requests broad Notion permission, official OAuth MCP already follows user's rights and outside-center access independently verified. Existing GitHub Actions safe_two_way engine can support flat paragraphs/headings but rejects tables/nesting. New toolkit is supplementary local MCP client, must not claim automatic deployment. Source file AppendixB has eleven tables counts [23,22,22,22,37,37,30,26,16,49,51] =335; last tables use A01/B01 ids. AppendixA holds108 detailed group-analysis table rows. Separate supplement source has ## 二、黑桃11版本逐段补研究 with ### C01-C11 each4 questions, stops at ## 三、思远11版本逐段补研究. Need user originals losslessly preserved; classifying visually ambiguous rows cannot pretend spoken transcript. Identify missing substantive analyses if initial parser only appB. Main controller will run real source and MCP, you don't have private source or live credentials. Independently run tests, add independent probes only to allowed review test file, e.g symlink state escape, uncertain creation recovery, MCP schema adapter matches runtime current shape known: tools Notion gives {server,tools:[{name,inputSchema}]}; notion-fetch(id) returns {server,tool,result:{content:[{type:text,text:JSON-string-inner}]}} inner {title,url,text:'Here...<page...><properties>...</properties><content>BODY</content></page>'}; notion-create-pages args {parent:{page_id:ID},pages:[{properties:{title:TITLE},content:BODY}]}, notion-update-page args {page_id:ID,command:'replace_content',new_str:BODY,allow_async:false}, sometimes async_task returned so must poll or fail safely. Determine safety/security/correctness of local writes, no private logs, serialization losses, full-text push verification, conflict handling, no-op/pull/push. Test suite self-evaluation not enough. Audit route isolated and report critical/high/medium findings with exact code line and reproducer. Produce audit markdown, structured JSON and independent tests; do not execute live Notion or any write outside allowed review files. Run verifiable tests without creating untracked delivery files. Commit/push report+tests and result manifest on own branch, preserve main and all originals. Summary <=500 Chinese chars, pass/fail/unverified, actual test counts, commit. If clear bug do not fix code; report to controller. Be rigorous but do not invent bugs. Continue until audit evidence complete or concrete blocker.",
+  "job_branch": "gpt-gemini/jobs/black9-audit-20261127",
+  "repository": "yinanan77/gemini-bridge",
+  "result_snapshot_path": "jobs/black9-audit-20261127/attempt-01/result.json",
+  "schema_version": 1,
+  "task_id": "black9-audit-20261127",
+  "task_snapshot_path": "jobs/black9-audit-20261127/attempt-01/task.json"
+}
