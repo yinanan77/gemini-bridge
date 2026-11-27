@@ -1,0 +1,36 @@
+{
+  "task_id": "black9-consolidate-20261127",
+  "attempt": 1,
+  "contract_sha256": "146a9510a5900507275490c18870e0bc019f70991880ecfd1aacd3293aa9f239",
+  "status": "completed",
+  "summary": "在隔离分支交付纯 Python 标准库的 Black9 Notion<->Obsidian 汇总与保守同步工具集：consolidate.py 严格解析 # 附录B 下 C01-C11 全部 11 个案例与 335 条单元（兼容 C10 A01／time 与 C11 1／time/变体），原样保留 ASR 与画面/无对白记录并分离呈现原文逐项与分析逐项，输出扁平标题段落（每行 <1900 字符）、manifest.json 及 90_source_reference.md，不含思源混合正文或用户成稿，并支持可选 minis-mcp-cli notion-fetch；sync.py 通过 minis-mcp-cli 运行时发现并校验 Notion MCP schema，支持 inspect/init/sync/status/--dry-run/--only/--recover，具备原子状态与操作 journal、不确定写入阻断与任务标识恢复、三方冲突双边保留至 conflicts/、推送后回读校验、符号链接拦截及零凭据/零私密日志输出；README.md 提供简洁中文命令、手工运行边界与 .sync/state.json 集成提案 JSON。全部 13 项单元测试均在本地通过 Mock MCP 验证通过，未执行真实 Notion 线上同步。",
+  "artifacts": [
+    "tools/black9/README.md",
+    "tools/black9/consolidate.py",
+    "tools/black9/sync.py",
+    "tools/black9/test_black9.py"
+  ],
+  "tests": [
+    {
+      "command": "python3 -B -m py_compile tools/black9/consolidate.py tools/black9/sync.py tools/black9/test_black9.py",
+      "mode": "local_compile",
+      "passed": 3,
+      "failed": 0,
+      "exit_code": 0
+    },
+    {
+      "command": "python3 -B -m unittest discover -s tools/black9 -p 'test_*.py' -v",
+      "mode": "local_mocked_mcp",
+      "passed": 13,
+      "failed": 0,
+      "exit_code": 0
+    },
+    {
+      "command": "python3 -B tools/black9/consolidate.py --help && python3 -B tools/black9/sync.py --help",
+      "mode": "local_cli_smoke",
+      "passed": 2,
+      "failed": 0,
+      "exit_code": 0
+    }
+  ]
+}
