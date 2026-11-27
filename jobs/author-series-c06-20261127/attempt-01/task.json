@@ -1,0 +1,26 @@
+{
+  "acceptance": [
+    "三份允许文件齐全且合法，台账只整理不写新框架",
+    "C06用户确认思远且排除黑桃作者统计",
+    "黑桃六条为沿用归属的文稿系列候选，不声称本轮原片作者全核或官方完整数",
+    "C06/C09旧group停止活跃合并但保存legacy_group与relation_status待复核，不宣称二者不是同人或同作者",
+    "registry除指定字段外原顶层值及22样本ID描述证据层保留",
+    "result记录实际JSON及字段差异测试"
+  ],
+  "allowed_write_paths": [
+    "author-series-20261127/AUTHOR_SERIES_INDEX.md",
+    "author-series-20261127/CHANGES.md",
+    "author-series-20261127/registry.json"
+  ],
+  "attempt": 1,
+  "base_branch": "main",
+  "contract_sha256": "31de9279ec0096060ab1a9b43da8cf226b49eafa939024a4c343e6bbb952ddaa",
+  "goal": "用户已明确要求整理Obsidian/Notion中的黑桃与思远资料，先核作者再分系列，不写新创作框架或文稿。最新最高依据：用户2026-11-27 11:38亲自纠正 C06/1000070192.mp4 西装约会长版（开头‘经常约会的朋友们都应该知道…’）属于思远，不是黑桃。旧库C06编号、黑桃11版本标题、C06-C09分组不证明作者。用户授权实际归属纠正与系列整理；不改确认稿/不删原始材料/不发布未认可创作框架。\n输入在本仓库 inputs/author-series-20261127/registry.json 和 source-excerpts.md。请只据任务材料做一份有据可查的现行归类清单和最小注册表补丁。不要调用外站/其他私库。\n输出1 AUTHOR_SERIES_INDEX.md（完整中文可读台账，不是创作框架，约1000-1600字）：四组：A黑桃约会系列候选6条，高智感原稿01(非C01)、豹纹原稿02=C07/1000070202(1)、蓝衬马甲C08/1000070459、西装短C09/1000070460、浅金黑框C10/play2、黑发卷发散步C11/play7；这些属于按文本系列特征归组，作者仍‘沿用原库归属，本轮未新增逐条原片作者核验’，不能叫六个作者全核或平台完整系列数量。逐行注明原稿/字幕层证据与路径，series_status=文稿同系列候选非官方编号。B思远材料：把C06单列用户已确认作者，不能为了转作者便给新S编号避免与S01-S11撞号；S01-S11沿用原注册描述不得冒新增确认。C黑桃其他案例C01金角/C02攒钱/C03长发/C04自然卷/C05阿坤及七原稿03-07等非约会模板，不因失恋/西装都混约会系列（部分未知归属标原库未复核）。D待复核：C06与C09旧库同人成品关系未被本轮重核；即使同人也不证明同作者，不能因用户纠正C06就断言C09也归思远、二者不是同人或跨作者改写。历史22/11/15统计不再作已确认作者样本数，未重做全量去重/不算新的21/10等数字。\n输出2 registry.json：在输入JSON上最小增量改，现有22条id/description/evidence_level保留。只在C06增加author=思远, author_status=用户确认, author_evidence=2026-11-27 11:38用户原话, exclude_from_black9=true, series=约会题材相关长版(是否系列未核); C06/C09旧group C06-C09改为各自id(表示活跃研究暂停合并不是否认同人)，两条均增legacy_group=C06-C09, relation_status=旧同人成品关联待复核。不为C09新增作者确定事实；其它id不改。顶层加author_series_inventory指向C端内容/创作系统/作者归属与系列索引.md，author_attribution_correction说明用户纠正与旧编号不证明作者；updated_on改2026-11-27，revision_history追加一条，旧历史不删。其它top字段逐字值不动(不更改required_entry_markers/未认可框架等)。\n输出3 CHANGES.md列字段级diff、依据、对旧推导/同人分组的限制、保留原库证据；不要自称已写Obsidian/Notion，只在桥接产候选。\n真实自测：registry是合法JSON，样本条目数量、id、description/evidence_level不变；只有指定顶层字段与C06/C09新增字段/group变更；C06正确确认归思远、排除黑桃；未给C09或其余样本伪造确认，未删原历史；台账候选与确认分开。输出完写result清单，真实记录自测，不用字符检查当作者事实核验。只commit push允许路径，不改inputs/其它历史目录。",
+  "job_branch": "gpt-gemini/jobs/author-series-c06-20261127",
+  "notes": "本次只提供本任务必要的用户文稿及注册信息，不读凭证、不启计费、不访问其它库。",
+  "repository": "yinanan77/gemini-bridge",
+  "result_snapshot_path": "jobs/author-series-c06-20261127/attempt-01/result.json",
+  "schema_version": 1,
+  "task_id": "author-series-c06-20261127",
+  "task_snapshot_path": "jobs/author-series-c06-20261127/attempt-01/task.json"
+}
