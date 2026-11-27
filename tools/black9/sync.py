@@ -735,6 +735,12 @@ def preflight_bundle_folder(folder: Path) -> dict[str, Any]:
             raise SyncError(
                 f"Manifest supplement_counts mismatch: got {supp_counts}, expected {expected_supp}"
             )
+        if manifest.get("supplement_format") == "markdown_table":
+            if manifest.get("supplement_table_count") != consolidate.EXPECTED_SUPPLEMENT_TABLES:
+                raise SyncError(
+                    f"Manifest supplement_table_count mismatch: got {manifest.get('supplement_table_count')}, "
+                    f"expected {consolidate.EXPECTED_SUPPLEMENT_TABLES}"
+                )
 
     allow_blanks = not bool(manifest.get("flat_markdown_no_blank_lines", False))
 

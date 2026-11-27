@@ -38,6 +38,8 @@ EXPECTED_TOTAL_GROUPS: int = 108
 EXPECTED_GROUP_COLUMNS: int = 7
 EXPECTED_SUPPLEMENT_ITEMS_PER_CASE: int = 4
 EXPECTED_TOTAL_SUPPLEMENT_ITEMS: int = 44
+EXPECTED_SUPPLEMENT_TABLE_COLUMNS: int = 4
+EXPECTED_SUPPLEMENT_TABLES: int = 11
 MAX_MD_LINE_CHARS: int = 1850  # Strictly < 1900 chars per line
 HARD_MD_LINE_LIMIT: int = 1900
 MANIFEST_FILENAME = "manifest.json"
@@ -52,6 +54,13 @@ DEFAULT_GROUP_HEADERS: tuple[str, ...] = (
     "位置与原因",
     "下组期待",
     "删掉损失",
+)
+
+DEFAULT_SUPPLEMENT_TABLE_HEADERS: tuple[str, ...] = (
+    "连续原段／阅读摘要",
+    "措辞与对象为什么这样组织",
+    "与前后段的接口",
+    "机械迁移怎样失效",
 )
 
 _APPENDIX_A_RE = re.compile(r"^#\s+附录\s*A(?:\b|[\s｜|：:\-—（(].*)?$")
@@ -162,6 +171,7 @@ class GroupRow:
 class SupplementItem:
     number: int
     text: str
+    cells: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -171,6 +181,8 @@ class SupplementCase:
     raw_heading: str
     intro_lines: tuple[str, ...]
     items: tuple[SupplementItem, ...]
+    source_format: str = "markdown_table"  # "markdown_table" | "numbered_list"
+    table_headers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -178,6 +190,7 @@ class ParsedSupplement:
     section_heading: str
     stopped_at_heading: str
     cases: tuple[SupplementCase, ...]
+    source_format: str = "markdown_table"  # "markdown_table" | "numbered_list"
 
 
 @dataclass(frozen=True)
@@ -642,11 +655,131 @@ def validate_parsed_source(parsed: ParsedSource) -> None:
         )
 
 
+def _parse_supplement_case_table(
+    body_lines: Sequence[str], case_id: str
+) -> tuple[bool, tuple[str, ...], list[SupplementItem], list[str]]:
+    """Detect and parse a 4-column Markdown pipe table inside a supplement `### Cxx` section.
+
+    Returns (found_table, headers, rows_as_items, non_table_intro_lines).
+    Raises SourceParseError if a Markdown pipe table is present with invalid column/row structure.
+    """
+    idx = 0
+    total = len(body_lines)
+    table_count = 0
+    headers: tuple[str, ...] = DEFAULT_SUPPLEMENT_TABLE_HEADERS
+    items: list[SupplementItem] = []
+    intro_lines: list[str] = []
+
+    while idx < total:
+        line = body_lines[idx]
+        if "|" in line and idx + 1 < total and "|" in body_lines[idx + 1]:
+            header_cells = split_markdown_table_row(line)
+            sep_cells = split_markdown_table_row(body_lines[idx + 1])
+            if (
+                len(header_cells) >= 2
+                and len(sep_cells) == len(header_cells)
+                and is_table_separator_row(sep_cells)
+            ):
+                table_count += 1
+                if table_count > 1:
+                    raise SourceParseError(
+                        f"Supplement {case_id}: expected exactly 1 Markdown table, found multiple"
+                    )
+                if len(header_cells) != EXPECTED_SUPPLEMENT_TABLE_COLUMNS:
+                    raise SourceParseError(
+                        f"Supplement {case_id}: expected {EXPECTED_SUPPLEMENT_TABLE_COLUMNS}-column "
+                        f"Markdown table, got {len(header_cells)} columns"
+                    )
+                headers = tuple(
+                    cell if cell else DEFAULT_SUPPLEMENT_TABLE_HEADERS[col_i]
+                    for col_i, cell in enumerate(header_cells)
+                )
+                idx += 2
+                row_num = 0
+                while idx < total:
+                    data_line = body_lines[idx]
+                    stripped = data_line.strip()
+                    if not stripped or "|" not in stripped:
+                        break
+                    cells = split_markdown_table_row(data_line)
+                    if is_table_separator_row(cells):
+                        idx += 1
+                        continue
+                    if len(cells) != EXPECTED_SUPPLEMENT_TABLE_COLUMNS:
+                        raise SourceParseError(
+                            f"Supplement {case_id}: expected {EXPECTED_SUPPLEMENT_TABLE_COLUMNS} "
+                            f"columns on table row {row_num + 1}, got {len(cells)}"
+                        )
+                    if not any(c.strip() for c in cells) or not cells[0].strip():
+                        raise SourceParseError(
+                            f"Supplement {case_id}: empty content on table row {row_num + 1}"
+                        )
+                    row_num += 1
+                    cell_tuple = tuple(cells)
+                    joined_text = "｜".join(
+                        f"{hdr}：{val}" for hdr, val in zip(headers, cell_tuple)
+                    )
+                    items.append(
+                        SupplementItem(
+                            number=row_num,
+                            text=joined_text,
+                            cells=cell_tuple,
+                        )
+                    )
+                    idx += 1
+                continue
+        if table_count == 0 and line.strip():
+            intro_lines.append(line.rstrip(" \t"))
+        idx += 1
+
+    return table_count == 1, headers, items, intro_lines
+
+
+def _parse_supplement_case_numbered_items(
+    body_lines: Sequence[str],
+) -> tuple[list[SupplementItem], list[str]]:
+    """Parse fallback numbered-list supplement variant (4 numbered items per case)."""
+    intro_lines: list[str] = []
+    items_acc: list[tuple[int, list[str]]] = []
+    for raw_line in body_lines:
+        # Top-level numbered items start at column 0 (no leading indentation).
+        if raw_line and not raw_line[0].isspace():
+            im = _SUPPLEMENT_ITEM_RE.match(raw_line)
+            if im:
+                if im.group(1):
+                    item_num = int(im.group(1))
+                    item_body = im.group(2)
+                elif im.group(3):
+                    num_m = re.match(r"^\*\*([1-9]\d*)", im.group(3))
+                    assert num_m is not None
+                    item_num = int(num_m.group(1))
+                    item_body = im.group(3)
+                else:
+                    item_num = int(im.group(4))
+                    item_body = im.group(5)
+                items_acc.append((item_num, [item_body]))
+                continue
+        if not items_acc:
+            if raw_line.strip():
+                intro_lines.append(raw_line.rstrip(" \t"))
+        else:
+            if raw_line.strip():
+                items_acc[-1][1].append(raw_line.rstrip(" \t"))
+
+    parsed_items = [
+        SupplementItem(number=num, text="\n".join(parts))
+        for num, parts in items_acc
+    ]
+    return parsed_items, intro_lines
+
+
 def parse_supplement_markdown(text: str) -> ParsedSupplement:
     """Parse optional Black9-only supplement Markdown from Notion 22-page body.
 
     Reads `## 二、黑桃11版本逐段补研究` through eleven `### C01`..`### C11` sections,
     strictly stopping at `## 三、思远11版本逐段补研究` (or any next `##`/`#` heading).
+    Primary format: 11 four-column Markdown tables (4 data rows each = 44 rows total).
+    Also supports the 4-item numbered-list variant for test compatibility.
     Never copies S01/Siyuan or user-final-script sections. Preserves `<br>` and rich markup literally.
     """
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -706,60 +839,57 @@ def parse_supplement_markdown(text: str) -> ParsedSupplement:
         )
         body_lines = section_lines[c_start + 1 : c_end]
 
-        intro_lines: list[str] = []
-        items_acc: list[tuple[int, list[str]]] = []
-        for raw_line in body_lines:
-            # Top-level numbered items start at column 0 (no leading indentation).
-            if raw_line and not raw_line[0].isspace():
-                im = _SUPPLEMENT_ITEM_RE.match(raw_line)
-                if im:
-                    if im.group(1):
-                        item_num = int(im.group(1))
-                        item_body = im.group(2)
-                    elif im.group(3):
-                        num_m = re.match(r"^\*\*([1-9]\d*)", im.group(3))
-                        assert num_m is not None
-                        item_num = int(num_m.group(1))
-                        item_body = im.group(3)
-                    else:
-                        item_num = int(im.group(4))
-                        item_body = im.group(5)
-                    items_acc.append((item_num, [item_body]))
-                    continue
-            if not items_acc:
-                if raw_line.strip():
-                    intro_lines.append(raw_line.rstrip(" \t"))
-            else:
-                if raw_line.strip():
-                    items_acc[-1][1].append(raw_line.rstrip(" \t"))
-
-        parsed_items = tuple(
-            SupplementItem(number=num, text="\n".join(parts))
-            for num, parts in items_acc
+        found_table, headers, table_items, table_intro = _parse_supplement_case_table(
+            body_lines, case_id
         )
-        cases.append(
-            SupplementCase(
-                case_id=case_id,
-                title=title or case_id,
-                raw_heading=raw_heading,
-                intro_lines=tuple(intro_lines),
-                items=parsed_items,
+        if found_table:
+            cases.append(
+                SupplementCase(
+                    case_id=case_id,
+                    title=title or case_id,
+                    raw_heading=raw_heading,
+                    intro_lines=tuple(table_intro),
+                    items=tuple(table_items),
+                    source_format="markdown_table",
+                    table_headers=headers,
+                )
             )
-        )
+        else:
+            list_items, list_intro = _parse_supplement_case_numbered_items(body_lines)
+            cases.append(
+                SupplementCase(
+                    case_id=case_id,
+                    title=title or case_id,
+                    raw_heading=raw_heading,
+                    intro_lines=tuple(list_intro),
+                    items=tuple(list_items),
+                    source_format="numbered_list",
+                    table_headers=(),
+                )
+            )
 
+    formats = {c.source_format for c in cases}
+    overall_format = next(iter(formats)) if len(formats) == 1 else "mixed"
     return ParsedSupplement(
         section_heading=section_heading,
         stopped_at_heading=stopped_at_heading,
         cases=tuple(cases),
+        source_format=overall_format,
     )
 
 
 def validate_parsed_supplement(supplement: ParsedSupplement) -> None:
-    """Strictly enforce 11 Black9 cases (C01..C11) x 4 numbered items = 44 total."""
+    """Strictly enforce 11 Black9 cases (C01..C11) x 4 rows/items = 44 total."""
     found_ids = tuple(c.case_id for c in supplement.cases)
     if found_ids != EXPECTED_CASE_IDS:
         raise SourceParseError(
             f"Supplement case IDs mismatch: expected {list(EXPECTED_CASE_IDS)}, got {list(found_ids)}"
+        )
+
+    formats = {c.source_format for c in supplement.cases}
+    if len(formats) != 1 or supplement.source_format not in ("markdown_table", "numbered_list"):
+        raise SourceParseError(
+            f"Supplement format inconsistent across cases: {[c.source_format for c in supplement.cases]}"
         )
 
     expected_nums = tuple(range(1, EXPECTED_SUPPLEMENT_ITEMS_PER_CASE + 1))
@@ -767,15 +897,33 @@ def validate_parsed_supplement(supplement: ParsedSupplement) -> None:
     for case in supplement.cases:
         nums = tuple(item.number for item in case.items)
         if nums != expected_nums:
+            kind_label = "table rows" if case.source_format == "markdown_table" else "numbered items"
             raise SourceParseError(
-                f"Supplement {case.case_id}: expected numbered items {list(expected_nums)}, "
+                f"Supplement {case.case_id}: expected 4 {kind_label} {list(expected_nums)}, "
                 f"got {list(nums)}"
             )
-        for item in case.items:
-            if not item.text.strip():
+        if case.source_format == "markdown_table":
+            if len(case.table_headers) != EXPECTED_SUPPLEMENT_TABLE_COLUMNS:
                 raise SourceParseError(
-                    f"Supplement {case.case_id}: numbered item {item.number} is empty"
+                    f"Supplement {case.case_id}: expected {EXPECTED_SUPPLEMENT_TABLE_COLUMNS} table headers, "
+                    f"got {len(case.table_headers)}"
                 )
+            for item in case.items:
+                if len(item.cells) != EXPECTED_SUPPLEMENT_TABLE_COLUMNS:
+                    raise SourceParseError(
+                        f"Supplement {case.case_id}: table row {item.number} expected "
+                        f"{EXPECTED_SUPPLEMENT_TABLE_COLUMNS} cells, got {len(item.cells)}"
+                    )
+                if not item.cells[0].strip() or not any(c.strip() for c in item.cells):
+                    raise SourceParseError(
+                        f"Supplement {case.case_id}: table row {item.number} has empty cells"
+                    )
+        else:
+            for item in case.items:
+                if not item.text.strip():
+                    raise SourceParseError(
+                        f"Supplement {case.case_id}: numbered item {item.number} is empty"
+                    )
         total_items += len(case.items)
 
     if total_items != EXPECTED_TOTAL_SUPPLEMENT_ITEMS:
@@ -1041,10 +1189,28 @@ def render_case_markdown(
 
     if supplement_case is not None:
         blocks.append("## 逐段补研究（黑桃9补充材料）")
-        blocks.append(
-            f"本节原样收录黑桃9补充材料中 {case.case_id} 的全部 {len(supplement_case.items)} 条既有编号分析条目，"
-            "不含思远（S01–S11）或用户最终成稿内容，保留原始 `<br>` 与富文本标记不做改写。"
+        supp_heading_label = (
+            f"{case.case_id}｜{supplement_case.title}"
+            if supplement_case.title and supplement_case.title != case.case_id
+            else case.case_id
         )
+        blocks.append(f"补研究原小节标题：{supp_heading_label}")
+        if supplement_case.source_format == "markdown_table":
+            supp_headers = (
+                supplement_case.table_headers
+                if len(supplement_case.table_headers) == EXPECTED_SUPPLEMENT_TABLE_COLUMNS
+                else DEFAULT_SUPPLEMENT_TABLE_HEADERS
+            )
+            blocks.append(
+                f"本节原样收录黑桃9补充材料中 {case.case_id} 对应的四列表格全部 {len(supplement_case.items)} 条数据行"
+                f"（表头：{'｜'.join(supp_headers)}），"
+                "已无损转换为扁平段落并记录各列标题，不含思远（S01–S11）或用户最终成稿内容，保留原始 `<br>` 与富文本标记不做改写。"
+            )
+        else:
+            blocks.append(
+                f"本节原样收录黑桃9补充材料中 {case.case_id} 的全部 {len(supplement_case.items)} 条既有编号分析条目，"
+                "不含思远（S01–S11）或用户最终成稿内容，保留原始 `<br>` 与富文本标记不做改写。"
+            )
         for intro_idx, intro_line in enumerate(supplement_case.intro_lines, start=1):
             blocks.extend(
                 emit_prefixed_paragraphs(
@@ -1054,14 +1220,30 @@ def render_case_markdown(
                 )
             )
         for item in supplement_case.items:
-            blocks.append(f"### 补研究 {item.number}｜{case.case_id}")
-            blocks.extend(
-                emit_prefixed_paragraphs(
-                    f"补研究条目 {item.number}（{case.case_id}）：",
-                    f"补研究条目 {item.number} 续（{case.case_id}）：",
-                    item.text,
+            if supplement_case.source_format == "markdown_table":
+                supp_headers = (
+                    supplement_case.table_headers
+                    if len(supplement_case.table_headers) == EXPECTED_SUPPLEMENT_TABLE_COLUMNS
+                    else DEFAULT_SUPPLEMENT_TABLE_HEADERS
                 )
-            )
+                blocks.append(f"### 补研究 {item.number}｜{supp_heading_label}")
+                for col_hdr, cell_val in zip(supp_headers, item.cells):
+                    blocks.extend(
+                        emit_prefixed_paragraphs(
+                            f"{col_hdr}（{case.case_id}-补{item.number}）：",
+                            f"{col_hdr}续（{case.case_id}-补{item.number}）：",
+                            cell_val,
+                        )
+                    )
+            else:
+                blocks.append(f"### 补研究 {item.number}｜{supp_heading_label}")
+                blocks.extend(
+                    emit_prefixed_paragraphs(
+                        f"补研究条目 {item.number}（{case.case_id}）：",
+                        f"补研究条目 {item.number} 续（{case.case_id}）：",
+                        item.text,
+                    )
+                )
 
     rendered = "\n".join(blocks) + "\n"
     validate_flat_markdown(rendered, case_filename(case.case_id))
@@ -1092,7 +1274,12 @@ def render_index_markdown(
     blocks.append(f"收录附录A 语义分组总数：{total_groups} 组")
     if supplement is not None:
         total_supp = sum(len(c.items) for c in supplement.cases)
-        blocks.append(f"收录黑桃9 逐段补研究条目总数：{total_supp} 条（11 案 x 4 条）")
+        if supplement.source_format == "markdown_table":
+            blocks.append(
+                f"收录黑桃9 逐段补研究总数：{len(supplement.cases)} 表 / {total_supp} 行（每表 4 列 × 4 行，无损转扁平段落）"
+            )
+        else:
+            blocks.append(f"收录黑桃9 逐段补研究条目总数：{total_supp} 条（11 案 x 4 条）")
     else:
         blocks.append("收录黑桃9 逐段补研究条目总数：未在本次构建中附加可选补研究材料")
     blocks.append(f"本地来源文件：{source_label}")
@@ -1127,7 +1314,9 @@ def render_index_markdown(
             f"附录A分组：{len(case.groups)} 组",
         ]
         if case.case_id in supp_by_case:
-            summary_parts.append(f"补研究：{len(supp_by_case[case.case_id].items)} 条")
+            sc = supp_by_case[case.case_id]
+            unit_word = "行" if sc.source_format == "markdown_table" else "条"
+            summary_parts.append(f"补研究：{len(sc.items)} {unit_word}")
         blocks.append("｜".join(summary_parts))
 
     blocks.append("## 配套文件说明")
@@ -1160,7 +1349,7 @@ def render_reference_markdown(
 
     blocks.append("## 收录边界与排除声明")
     blocks.append(
-        "本汇总目录严格限定为黑桃9 11 个案例（C01 至 C11，共 335 条附录B 单元记录、108 组附录A 语义分组分析及可选的 44 条黑桃9 逐段补研究）。"
+        "本汇总目录严格限定为黑桃9 11 个案例（C01 至 C11，共 335 条附录B 单元记录、108 组附录A 语义分组分析及可选的 44 条/行黑桃9 逐段补研究）。"
         "本文件不复制完整的思源（S01–S11）混合资料，也不收录用户本人的最终成稿或原创脚本。"
     )
     blocks.append(
@@ -1186,10 +1375,16 @@ def render_reference_markdown(
             blocks.append(f"补研究文件路径：{supplement_label}")
         if supplement_sha256:
             blocks.append(f"补研究文件 SHA-256：{supplement_sha256}")
-        blocks.append(
-            f"已校验补研究结构：共 {len(supplement.cases)} 个案例（仅截取黑桃9逐段补研究区段并在后续非黑桃区段前停止），"
-            f"条目分布 {[len(c.items) for c in supplement.cases]}，合计 {sum(len(c.items) for c in supplement.cases)} 条。"
-        )
+        if supplement.source_format == "markdown_table":
+            blocks.append(
+                f"已校验补研究结构：共 {len(supplement.cases)} 表（仅截取黑桃9逐段补研究区段并在后续非黑桃区段前停止），"
+                f"各表数据行分布 {[len(c.items) for c in supplement.cases]}，合计 {sum(len(c.items) for c in supplement.cases)} 行（全部 4 列单元格已无损转扁平段落）。"
+            )
+        else:
+            blocks.append(
+                f"已校验补研究结构：共 {len(supplement.cases)} 个案例（仅截取黑桃9逐段补研究区段并在后续非黑桃区段前停止），"
+                f"条目分布 {[len(c.items) for c in supplement.cases]}，合计 {sum(len(c.items) for c in supplement.cases)} 条。"
+            )
 
     blocks.append("## Notion 来源链接")
     if source_urls:
@@ -1415,9 +1610,26 @@ def build_bundle(
                     }
                     for g in case.groups
                 ],
+                "supplement_title": supp_case.title if supp_case is not None else None,
+                "supplement_format": supp_case.source_format if supp_case is not None else None,
+                "supplement_table_headers": (
+                    list(supp_case.table_headers) if supp_case is not None else []
+                ),
                 "supplement_item_count": len(supp_case.items) if supp_case is not None else 0,
                 "supplement_items": [
-                    {"number": it.number, "text": it.text}
+                    (
+                        {
+                            "number": it.number,
+                            "text": it.text,
+                            "cells": list(it.cells),
+                            "fields": [
+                                {"header": hdr, "text": val}
+                                for hdr, val in zip(supp_case.table_headers, it.cells)
+                            ],
+                        }
+                        if supp_case is not None and supp_case.source_format == "markdown_table"
+                        else {"number": it.number, "text": it.text}
+                    )
                     for it in (supp_case.items if supp_case is not None else ())
                 ],
                 "rows": [
@@ -1485,6 +1697,12 @@ def build_bundle(
         if parsed_supplement is not None
         else []
     )
+    supplement_format = parsed_supplement.source_format if parsed_supplement is not None else None
+    supplement_table_count = (
+        len(parsed_supplement.cases)
+        if parsed_supplement is not None and parsed_supplement.source_format == "markdown_table"
+        else 0
+    )
 
     manifest_obj: dict[str, Any] = {
         "schema_version": 2,
@@ -1500,6 +1718,8 @@ def build_bundle(
         "total_groups": total_groups,
         "actual_group_counts": actual_group_counts,
         "supplement_included": parsed_supplement is not None,
+        "supplement_format": supplement_format,
+        "supplement_table_count": supplement_table_count,
         "supplement_label": supplement_label,
         "supplement_sha256": supplement_hash,
         "supplement_urls": list(clean_supp_urls),
@@ -1534,6 +1754,8 @@ def build_bundle(
         "total_groups": total_groups,
         "group_counts": actual_group_counts,
         "supplement_included": parsed_supplement is not None,
+        "supplement_format": supplement_format,
+        "supplement_table_count": supplement_table_count,
         "supplement_sha256": supplement_hash,
         "supplement_item_count": supplement_item_count,
         "supplement_counts": supplement_counts,

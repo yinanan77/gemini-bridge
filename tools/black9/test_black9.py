@@ -142,10 +142,12 @@ def build_synthetic_source_markdown(
 def build_synthetic_supplement_markdown(
     *,
     truncate_after_case: int | None = None,
-    drop_item_in_case: str | None = None,
+    drop_row_in_case: str | None = None,
+    extra_row_in_case: str | None = None,
+    wrong_col_count_in_case: str | None = None,
     inject_siyuan_inside_black9: bool = False,
 ) -> str:
-    """Build a realistic extracted BODY from the Notion 22-page supplement document."""
+    """Build a realistic extracted BODY from Notion 22-page: 11 four-column Markdown tables x 4 data rows = 44 rows."""
     lines: list[str] = [
         "# 22版本逐段补研究",
         "",
@@ -158,6 +160,80 @@ def build_synthetic_supplement_markdown(
 
     limit = truncate_after_case if truncate_after_case is not None else len(consolidate.EXPECTED_CASE_IDS)
     for idx, case_id in enumerate(consolidate.EXPECTED_CASE_IDS[:limit], start=1):
+        lines.append(f"### {case_id}｜黑桃9案例标题{idx}")
+        lines.append("")
+        if case_id == wrong_col_count_in_case:
+            lines.append("| 连续原段／阅读摘要 | 措辞与对象为什么这样组织 | 与前后段的接口 |")
+            lines.append("| --- | --- | --- |")
+            for row_i in range(1, 5):
+                lines.append(f"| {case_id} 摘要{row_i} | 组织{row_i} | 接口{row_i} |")
+            lines.append("")
+            continue
+
+        lines.append(
+            "| 连续原段／阅读摘要 | 措辞与对象为什么这样组织 | 与前后段的接口 | 机械迁移怎样失效 |"
+        )
+        lines.append("| --- | --- | --- | --- |")
+
+        row_nums = [1, 2, 3] if case_id == drop_row_in_case else [1, 2, 3, 4]
+        if case_id == extra_row_in_case:
+            row_nums = [1, 2, 3, 4, 5]
+
+        for num in row_nums:
+            if case_id == "C01" and num == 1:
+                c1 = f"**开场连续原段**：第一段<br>第二段含私密锚点（{PRIVATE_SENTINEL}）"
+                c2 = "先给对象再压反差，含转义竖线 措辞A\\|措辞B 与 **加粗强调**"
+                c3 = "承接开场悬念<br/>自然过渡到第2段演示"
+                c4 = "若机械套用公式，会丢失具体场景锚点与 `inline_code` 细节"
+            else:
+                c1 = f"{case_id} 第{num}段连续原段摘要（保留原词）"
+                c2 = f"{case_id} 第{num}段措辞与对象组织分析<br>含补充细节"
+                c3 = f"{case_id} 第{num}段与前后段接口关系"
+                c4 = f"{case_id} 第{num}段机械迁移失效原因"
+            lines.append(f"| {c1} | {c2} | {c3} | {c4} |")
+        lines.append("")
+
+    if inject_siyuan_inside_black9:
+        lines.append("### S01｜思远误混入黑桃区")
+        lines.append(
+            "| 连续原段／阅读摘要 | 措辞与对象为什么这样组织 | 与前后段的接口 | 机械迁移怎样失效 |"
+        )
+        lines.append("| --- | --- | --- | --- |")
+        lines.append(f"| {SIYUAN_NOISE} | 误混入 | 误混入 | 误混入 |")
+        lines.append("")
+
+    lines.extend(
+        [
+            "## 三、思远11版本逐段补研究",
+            "",
+            "### S01｜思远案例1",
+            "| 连续原段／阅读摘要 | 措辞与对象为什么这样组织 | 与前后段的接口 | 机械迁移怎样失效 |",
+            "| --- | --- | --- | --- |",
+            f"| 思远内容绝不进入黑桃9汇总：{SIYUAN_NOISE} | 思远组织 | 思远接口 | 思远失效 |",
+            "| 思远第2行 | 思远组织2 | 思远接口2 | 思远失效2 |",
+            "| 思远第3行 | 思远组织3 | 思远接口3 | 思远失效3 |",
+            "| 思远第4行 | 思远组织4 | 思远接口4 | 思远失效4 |",
+            "",
+            "## 四、用户最终成稿",
+            f"用户最终成稿内容绝不进入黑桃9汇总：{USER_SCRIPT_NOISE}",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_synthetic_supplement_numbered_markdown(
+    *,
+    drop_item_in_case: str | None = None,
+) -> str:
+    """Build the numbered-list supplement test variant (11 cases x 4 numbered items = 44)."""
+    lines: list[str] = [
+        "# 22版本逐段补研究（编号变体）",
+        "",
+        "## 二、黑桃11版本逐段补研究",
+        "",
+    ]
+    for idx, case_id in enumerate(consolidate.EXPECTED_CASE_IDS, start=1):
         lines.append(f"### {case_id}｜黑桃9案例标题{idx}")
         item_nums = [1, 2, 3] if case_id == drop_item_in_case else [1, 2, 3, 4]
         for num in item_nums:
@@ -172,23 +248,12 @@ def build_synthetic_supplement_markdown(
                 lines.append(f"{num}. **{case_id} 补研究项 {num}**：完整原样分析文本，含 `inline_code` 与 *斜体*。")
         lines.append("")
 
-    if inject_siyuan_inside_black9:
-        lines.append("### S01｜思远误混入黑桃区")
-        lines.append(f"1. {SIYUAN_NOISE}")
-        lines.append("")
-
     lines.extend(
         [
             "## 三、思远11版本逐段补研究",
             "",
             "### S01｜思远案例1",
             f"1. 思远内容绝不进入黑桃9汇总：{SIYUAN_NOISE}",
-            "2. 思远第二项",
-            "3. 思远第三项",
-            "4. 思远第四项",
-            "",
-            "## 四、用户最终成稿",
-            f"用户最终成稿内容绝不进入黑桃9汇总：{USER_SCRIPT_NOISE}",
             "",
         ]
     )
@@ -803,6 +868,7 @@ class Black9ConsolidateTests(unittest.TestCase):
         self.assertFalse(never_out.exists())
 
     def test_optional_supplement_44_items_markup_preserved_and_siyuan_excluded(self) -> None:
+        """Primary real Notion 22-page export format: 11 four-column Markdown tables x 4 data rows = 44 rows."""
         supp_file = self.tmp_path / "supplement_22.md"
         supp_file.write_text(build_synthetic_supplement_markdown(), encoding="utf-8")
 
@@ -818,6 +884,8 @@ class Black9ConsolidateTests(unittest.TestCase):
         self.assertEqual(report["total_units"], 335)
         self.assertEqual(report["total_groups"], 108)
         self.assertTrue(report["supplement_included"])
+        self.assertEqual(report["supplement_format"], "markdown_table")
+        self.assertEqual(report["supplement_table_count"], 11)
         self.assertEqual(report["supplement_item_count"], 44)
         self.assertEqual(report["supplement_counts"], [4] * 11)
         self.assertEqual(report["supplement_sha256"], consolidate.sha256_bytes(supp_file.read_bytes()))
@@ -825,19 +893,51 @@ class Black9ConsolidateTests(unittest.TestCase):
         bundle_dir = Path(report["bundle_dir"])
         manifest = json.loads((bundle_dir / consolidate.MANIFEST_FILENAME).read_text(encoding="utf-8"))
         self.assertTrue(manifest["supplement_included"])
+        self.assertEqual(manifest["supplement_format"], "markdown_table")
+        self.assertEqual(manifest["supplement_table_count"], 11)
         self.assertEqual(manifest["supplement_item_count"], 44)
         self.assertEqual(manifest["supplement_urls"], ["https://www.notion.so/supplement-22"])
         self.assertEqual(manifest["supplement_sha256"], report["supplement_sha256"])
 
-        # Check C01 preserves <br>, <br/>, rich markup, multi-line sub-bullet literally as flat paragraphs
+        expected_headers = [
+            "连续原段／阅读摘要",
+            "措辞与对象为什么这样组织",
+            "与前后段的接口",
+            "机械迁移怎样失效",
+        ]
+        # Verify ALL 11 cases x 4 rows x 4 columns (176 cells) + column headers & titles are preserved in flat paragraphs
+        total_cells_checked = 0
+        for case_meta in manifest["cases"]:
+            cid = case_meta["case_id"]
+            self.assertEqual(case_meta["supplement_format"], "markdown_table")
+            self.assertEqual(case_meta["supplement_table_headers"], expected_headers)
+            self.assertEqual(case_meta["supplement_item_count"], 4)
+            case_text = (bundle_dir / case_meta["filename"]).read_text(encoding="utf-8")
+            self.assertIn("## 逐段补研究（黑桃9补充材料）", case_text)
+            self.assertIn(f"补研究原小节标题：{cid}｜{case_meta['supplement_title']}", case_text)
+            for item_meta in case_meta["supplement_items"]:
+                self.assertEqual(len(item_meta["cells"]), 4)
+                self.assertEqual(len(item_meta["fields"]), 4)
+                for field in item_meta["fields"]:
+                    hdr = field["header"]
+                    val = field["text"]
+                    self.assertIn(f"{hdr}（{cid}-补{item_meta['number']}）：{val}", case_text)
+                    total_cells_checked += 1
+        self.assertEqual(total_cells_checked, 176)
+
+        # Check C01 preserves <br>, <br/>, escaped pipe, rich markup literally as flat paragraphs
         c01_text = (bundle_dir / "01_C01.md").read_text(encoding="utf-8")
-        self.assertIn("## 逐段补研究（黑桃9补充材料）", c01_text)
         self.assertIn("第一段<br>第二段", c01_text)
+        self.assertIn("措辞A|措辞B", c01_text)
         self.assertIn("**加粗强调**", c01_text)
-        self.assertIn("第一行含<br/>软换行。", c01_text)
-        self.assertIn("缩进子项原样保留不丢弃", c01_text)
+        self.assertIn("承接开场悬念<br/>自然过渡到第2段演示", c01_text)
+        self.assertIn("`inline_code`", c01_text)
         self.assertIn("https://www.notion.so/supplement-22", c01_text)
         self.assertIn(manifest["supplement_sha256"], c01_text)
+
+        # Verify 00_index.md and 90_source_reference.md report 11 tables / 44 rows
+        self.assertIn("11 表 / 44 行", (bundle_dir / consolidate.INDEX_FILENAME).read_text(encoding="utf-8"))
+        self.assertIn("共 11 表", (bundle_dir / consolidate.REFERENCE_FILENAME).read_text(encoding="utf-8"))
 
         # Verify ALL 13 generated .md files strictly exclude S01/Siyuan/user-final-script and pass flat validation
         for entry in manifest["files"]:
@@ -871,13 +971,39 @@ class Black9ConsolidateTests(unittest.TestCase):
             )
         self.assertEqual(rc, 0)
         cli_report = json.loads(out_buf.getvalue())
+        self.assertEqual(cli_report["supplement_format"], "markdown_table")
+        self.assertEqual(cli_report["supplement_table_count"], 11)
         self.assertEqual(cli_report["supplement_item_count"], 44)
         self.assertEqual(cli_report["total_groups"], 108)
+
+    def test_optional_supplement_numbered_variant_also_supported(self) -> None:
+        """Also support the 11x4 numbered-list supplement variant alongside the primary 11-table format."""
+        supp_num = self.tmp_path / "supplement_numbered.md"
+        supp_num.write_text(build_synthetic_supplement_numbered_markdown(), encoding="utf-8")
+        out_dir = self.tmp_path / "numbered_variant_out"
+        out_dir.mkdir()
+
+        report = consolidate.build_bundle(
+            source_path=self.source_file,
+            output_dir=out_dir,
+            supplement_path=supp_num,
+            supplement_urls=["https://www.notion.so/supplement-numbered"],
+        )
+        self.assertEqual(report["supplement_format"], "numbered_list")
+        self.assertEqual(report["supplement_table_count"], 0)
+        self.assertEqual(report["supplement_item_count"], 44)
+        self.assertEqual(report["supplement_counts"], [4] * 11)
+
+        bundle_dir = Path(report["bundle_dir"])
+        c01_text = (bundle_dir / "01_C01.md").read_text(encoding="utf-8")
+        self.assertIn("第一段<br>第二段", c01_text)
+        self.assertIn("缩进子项原样保留不丢弃", c01_text)
+        self.assertNotIn(SIYUAN_NOISE, c01_text)
 
     def test_optional_supplement_malformed_truncated_or_siyuan_leak_fails(self) -> None:
         never_out = self.tmp_path / "never_supp"
 
-        # 1. Truncated supplement (stops at C09 -> only 9 cases)
+        # 1. Truncated table supplement (stops at C09 -> only 9 tables / 36 rows)
         trunc = self.tmp_path / "supp_trunc.md"
         trunc.write_text(build_synthetic_supplement_markdown(truncate_after_case=9), encoding="utf-8")
         with self.assertRaises(consolidate.SourceParseError):
@@ -886,18 +1012,40 @@ class Black9ConsolidateTests(unittest.TestCase):
             )
         self.assertFalse(never_out.exists())
 
-        # 2. Missing 4th numbered item in C11 (43 != 44)
-        missing_item = self.tmp_path / "supp_missing_item.md"
-        missing_item.write_text(
-            build_synthetic_supplement_markdown(drop_item_in_case="C11"), encoding="utf-8"
+        # 2. Missing 4th data row in C11 table (43 != 44)
+        missing_row = self.tmp_path / "supp_missing_row.md"
+        missing_row.write_text(
+            build_synthetic_supplement_markdown(drop_row_in_case="C11"), encoding="utf-8"
         )
         with self.assertRaises(consolidate.SourceParseError):
             consolidate.build_bundle(
-                source_path=self.source_file, output_dir=never_out, supplement_path=missing_item
+                source_path=self.source_file, output_dir=never_out, supplement_path=missing_row
             )
         self.assertFalse(never_out.exists())
 
-        # 3. Unexpected S01/Siyuan ### heading leaked inside Black9 section
+        # 3. Extra 5th data row in C10 table (45 != 44)
+        extra_row = self.tmp_path / "supp_extra_row.md"
+        extra_row.write_text(
+            build_synthetic_supplement_markdown(extra_row_in_case="C10"), encoding="utf-8"
+        )
+        with self.assertRaises(consolidate.SourceParseError):
+            consolidate.build_bundle(
+                source_path=self.source_file, output_dir=never_out, supplement_path=extra_row
+            )
+        self.assertFalse(never_out.exists())
+
+        # 4. Wrong column count (3 columns instead of 4) in C05 table
+        bad_cols = self.tmp_path / "supp_bad_cols.md"
+        bad_cols.write_text(
+            build_synthetic_supplement_markdown(wrong_col_count_in_case="C05"), encoding="utf-8"
+        )
+        with self.assertRaises(consolidate.SourceParseError):
+            consolidate.build_bundle(
+                source_path=self.source_file, output_dir=never_out, supplement_path=bad_cols
+            )
+        self.assertFalse(never_out.exists())
+
+        # 5. Unexpected S01/Siyuan ### heading leaked inside Black9 section
         leaked = self.tmp_path / "supp_leaked_siyuan.md"
         leaked.write_text(
             build_synthetic_supplement_markdown(inject_siyuan_inside_black9=True), encoding="utf-8"
@@ -908,7 +1056,18 @@ class Black9ConsolidateTests(unittest.TestCase):
             )
         self.assertFalse(never_out.exists())
 
-        # 4. --supplement-url without --supplement fails cleanly
+        # 6. Numbered-list variant missing 4th item in C11 also fails
+        bad_num = self.tmp_path / "supp_bad_num.md"
+        bad_num.write_text(
+            build_synthetic_supplement_numbered_markdown(drop_item_in_case="C11"), encoding="utf-8"
+        )
+        with self.assertRaises(consolidate.SourceParseError):
+            consolidate.build_bundle(
+                source_path=self.source_file, output_dir=never_out, supplement_path=bad_num
+            )
+        self.assertFalse(never_out.exists())
+
+        # 7. --supplement-url without --supplement fails cleanly
         with self.assertRaises(consolidate.SourceParseError):
             consolidate.build_bundle(
                 source_path=self.source_file,
