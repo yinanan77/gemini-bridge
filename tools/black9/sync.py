@@ -90,7 +90,7 @@ def canonicalize_markdown(text: str, *, strip_notion_xml: bool = False) -> str:
     - Normalizes line endings (`\\r\\n`, `\\r` -> `\\n`).
     - Normalizes `<br/>`, `<br />`, `<br>` -> `\\n`.
     - Strips trailing horizontal whitespace per line.
-    - Collapses 3+ consecutive newlines to 2 newlines and trims leading/trailing blank lines.
+    - Omits blank lines (matching flat builder output and scripts/notion_sync.py simple renderer).
     """
     working = text
     if strip_notion_xml:
@@ -98,9 +98,8 @@ def canonicalize_markdown(text: str, *, strip_notion_xml: bool = False) -> str:
     working = working.replace("\r\n", "\n").replace("\r", "\n")
     working = _BR_TAG_RE.sub("\n", working)
     lines = [line.rstrip(" \t") for line in working.split("\n")]
-    joined = "\n".join(lines)
-    joined = re.sub(r"\n{3,}", "\n\n", joined)
-    return joined.strip("\n")
+    non_empty = [line for line in lines if line.strip()]
+    return "\n".join(non_empty)
 
 
 def _extract_schema(tool_def: dict[str, Any]) -> dict[str, Any]:
@@ -705,6 +704,40 @@ def preflight_bundle_folder(folder: Path) -> dict[str, Any]:
             f"expected {list(consolidate.EXPECTED_COUNTS)}"
         )
 
+    if "total_groups" in manifest:
+        if manifest.get("total_groups") != consolidate.EXPECTED_TOTAL_GROUPS:
+            raise SyncError(
+                f"Manifest total_groups mismatch: got {manifest.get('total_groups')}, "
+                f"expected {consolidate.EXPECTED_TOTAL_GROUPS}"
+            )
+        group_counts = manifest.get("actual_group_counts")
+        if (
+            not isinstance(group_counts, list)
+            or len(group_counts) != len(consolidate.EXPECTED_CASE_IDS)
+            or any(not isinstance(v, int) or v <= 0 for v in group_counts)
+            or sum(group_counts) != consolidate.EXPECTED_TOTAL_GROUPS
+        ):
+            raise SyncError(
+                f"Manifest actual_group_counts invalid: {group_counts}"
+            )
+
+    if manifest.get("supplement_included"):
+        if manifest.get("supplement_item_count") != consolidate.EXPECTED_TOTAL_SUPPLEMENT_ITEMS:
+            raise SyncError(
+                f"Manifest supplement_item_count mismatch: got {manifest.get('supplement_item_count')}, "
+                f"expected {consolidate.EXPECTED_TOTAL_SUPPLEMENT_ITEMS}"
+            )
+        supp_counts = manifest.get("supplement_counts")
+        expected_supp = [consolidate.EXPECTED_SUPPLEMENT_ITEMS_PER_CASE] * len(
+            consolidate.EXPECTED_CASE_IDS
+        )
+        if supp_counts != expected_supp:
+            raise SyncError(
+                f"Manifest supplement_counts mismatch: got {supp_counts}, expected {expected_supp}"
+            )
+
+    allow_blanks = not bool(manifest.get("flat_markdown_no_blank_lines", False))
+
     files = manifest.get("files")
     if not isinstance(files, list) or len(files) != 13:
         raise SyncError(f"Manifest must list exactly 13 Notion-syncable .md files, got {len(files) if isinstance(files, list) else 'invalid'}")
@@ -739,7 +772,7 @@ def preflight_bundle_folder(folder: Path) -> dict[str, Any]:
                 f"Preflight hash mismatch for {fname}: disk={actual_hash}, manifest={expected_hash}"
             )
         text = raw_bytes.decode("utf-8")
-        consolidate.validate_flat_markdown(text, fname)
+        consolidate.validate_flat_markdown(text, fname, allow_blank_lines=allow_blanks)
         verified_docs.append(
             {
                 "doc_id": doc_id,
@@ -777,7 +810,7 @@ def _collection_parent_body(manifest: dict[str, Any], task_marker: str) -> str:
         f"来源文件 SHA-256：{manifest.get('source_sha256', '')}",
         f"校验计数：{manifest.get('case_count', 0)} 个案例，共 {manifest.get('total_units', 0)} 条单元。",
     ]
-    return "\n\n".join(blocks) + "\n"
+    return "\n".join(blocks) + "\n"
 
 
 def _recover_uncertain_create(

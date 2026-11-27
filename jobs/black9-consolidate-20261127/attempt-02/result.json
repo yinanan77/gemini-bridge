@@ -1,0 +1,37 @@
+{
+  "task_id": "black9-consolidate-20261127",
+  "attempt": 2,
+  "contract_sha256": "639234c7d06ef11a50c9d4f9452503b11b263cb4ec5774257adf4e2ebc23731f",
+  "status": "completed",
+  "summary": "基于 commit 37aac5a 完成 Black9 工具集的增量修复与扩展（纯 Python 标准库）：1）修复真实格式画面/混合记录分类（将 C11 B06 表情停顿/无底部解释性字幕、B51 无解释性字幕的成品尾留归为 visual_or_non_spoken，将 C10 A05 反应近景+小字+随后“哈哈”归为 mixed_visual_and_text，其余归为保守的 source_text_unverified），移除口播正文定性与 spoken_count 数值标签，无虚构纯音乐/无声断言，完整保留全部 335 条原始单元；2）在 consolidate.py 新增 # 附录A 7 列分组解析与强校验（11 案映射与精确 108 组）并无损输出至各案例页与 manifest.json；3）新增可选 --supplement 与 --supplement-url（及 --vault 别名），仅截取 ## 二、黑桃11版本逐段补研究 下 C01–C11 每案 4 条共 44 条编号条目，严格止于 ## 三、思远11版本逐段补研究 之前并排除思远/S01/用户成稿，原样保留 <br> 与富文本标记并记录补研究哈希与计数；4）在 ## 原文逐项 之前新增 ## 文稿连读（依据已存文字，非重新听审），按原序连贯输出未标注画面/混合的已存文字记录且不补写过渡或标点，被排除项保留于显式画面与混合记录清单及原文逐项；5）构建期输出无空行扁平 H1–H3 Markdown（匹配现有 scripts/notion_sync.py 简单渲染器且 init 子页不注入隐藏标记），更新 sync.py 规范化与 preflight；6）新增 tools/black9/deploy.py（inspect/prepare/install），通过 minis-mcp-cli 只读拉取 yinanan77/E-Made 最新 .sync/state.json 与 sync-config.json 并逐页 notion-fetch 校验全文规范化一致后，保留全部既有记录与配置并仅增量注册本目录 13 个页面，导出 push_files_payload.json 供主控显式执行（不自动发布、不改动工作流/定时任务/脚本），install 仅复制新建目录且默认不覆盖本地旧同步元数据。全部 22 项本地 Mock 单元测试与编译/CLI 冒烟检查均通过，未执行真实线上 Notion 或 GitHub 写入。",
+  "artifacts": [
+    "tools/black9/README.md",
+    "tools/black9/consolidate.py",
+    "tools/black9/deploy.py",
+    "tools/black9/sync.py",
+    "tools/black9/test_black9.py"
+  ],
+  "tests": [
+    {
+      "command": "python3 -B -m py_compile tools/black9/consolidate.py tools/black9/sync.py tools/black9/deploy.py tools/black9/test_black9.py",
+      "mode": "local_compile",
+      "passed": 4,
+      "failed": 0,
+      "exit_code": 0
+    },
+    {
+      "command": "python3 -B -m unittest discover -s tools/black9 -p 'test_*.py' -v",
+      "mode": "local_mocked_mcp",
+      "passed": 22,
+      "failed": 0,
+      "exit_code": 0
+    },
+    {
+      "command": "python3 -B tools/black9/consolidate.py --help && python3 -B tools/black9/consolidate.py build --help && python3 -B tools/black9/sync.py --help && python3 -B tools/black9/deploy.py --help && python3 -B tools/black9/deploy.py prepare --help && python3 -B tools/black9/deploy.py install --help",
+      "mode": "local_cli_smoke",
+      "passed": 6,
+      "failed": 0,
+      "exit_code": 0
+    }
+  ]
+}

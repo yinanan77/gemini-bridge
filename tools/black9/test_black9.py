@@ -7,6 +7,7 @@ All Notion MCP interactions are mocked locally; no live Notion API, credentials,
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import io
 import json
@@ -24,21 +25,29 @@ if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
 import consolidate  # noqa: E402
+import deploy  # noqa: E402
 import sync  # noqa: E402
 
 ROOT_PARENT_ID = "11111111-2222-3333-4444-555555555555"
 PRIVATE_SENTINEL = "PRIVATE_MANUSCRIPT_SENTINEL_XYZ987"
 SIYUAN_NOISE = "SIYUAN_MIXED_ARCHIVE_DO_NOT_COPY_999"
 USER_SCRIPT_NOISE = "USER_OWN_FINAL_SCRIPT_DO_NOT_COPY_888"
+DEFAULT_GROUP_COUNTS: tuple[int, ...] = (10, 10, 10, 10, 10, 10, 10, 10, 8, 10, 10)  # sum = 108
+
+REAL_C11_B06 = "表情停顿，无底部解释性字幕"
+REAL_C11_B51 = "无解释性字幕的成品尾留"
+REAL_C10_A05 = "反应近景；小字“这得挨不少电”；随后“哈哈”"
 
 
 def build_synthetic_source_markdown(
     *,
     counts: tuple[int, ...] = consolidate.EXPECTED_COUNTS,
+    group_counts: tuple[int, ...] = DEFAULT_GROUP_COUNTS,
+    include_appendix_a: bool = True,
     include_c11: bool = True,
     long_cell_chars: int = 2400,
 ) -> str:
-    """Build a realistic synthetic source analysis Markdown fixture with all 11 variants."""
+    """Build a realistic synthetic source analysis Markdown fixture with Appendix A (108 groups) + Appendix B (335 units)."""
     lines: list[str] = [
         "# 跨案总览与前置材料",
         "",
@@ -48,11 +57,35 @@ def build_synthetic_source_markdown(
         "## 用户本人最终脚本草稿",
         f"这段是用户成稿：{USER_SCRIPT_NOISE}",
         "",
-        "# 附录B｜黑桃9 十一案逐单元原文与分析",
-        "",
     ]
 
     case_ids = consolidate.EXPECTED_CASE_IDS if include_c11 else consolidate.EXPECTED_CASE_IDS[:-1]
+
+    if include_appendix_a:
+        lines.append("# 附录A｜黑桃9 十一案语义分组分析（108组）")
+        lines.append("")
+        for case_idx, case_id in enumerate(case_ids):
+            g_count = group_counts[case_idx]
+            lines.append(f"## {case_id}｜黑桃9案例标题{case_idx + 1}")
+            lines.append("")
+            lines.append("| groupID | mechanisms | read-before | change | position/reason | next-expectation | deletion-loss |")
+            lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+            for g in range(1, g_count + 1):
+                gid = f"{case_id}-G{g:02d}"
+                mech = f"{gid} 机制A\\|机制B"
+                read_before = f"{gid} 读到这里前状态"
+                change = f"{gid} 本组造成的认知变化"
+                pos_reason = f"{gid} 放置在此位置的原因"
+                next_exp = f"{gid} 引发的下一组期待"
+                del_loss = f"{gid} 删掉后的结构损失"
+                lines.append(
+                    f"| {gid} | {mech} | {read_before} | {change} | {pos_reason} | {next_exp} | {del_loss} |"
+                )
+            lines.append("")
+
+    lines.append("# 附录B｜黑桃9 十一案逐单元原文与分析")
+    lines.append("")
+
     for case_idx, case_id in enumerate(case_ids):
         row_count = counts[case_idx]
         lines.append(f"## {case_id}｜黑桃9案例标题{case_idx + 1}")
@@ -67,8 +100,10 @@ def build_synthetic_source_markdown(
                 # C10 variant: non-digit prefix A01／time (49 rows)
                 unit_id = f"A{r:02d}／{ts}"
             elif case_id == "C11":
-                # C11 variant: mix of 1／time, V02／time, numeric/variant (51 rows)
-                if r % 3 == 1:
+                # C11 variant: mix of 1／time, V02／time, B06/B51 numeric/variant (51 rows)
+                if r in (6, 51):
+                    unit_id = f"B{r:02d}／{ts}"
+                elif r % 3 == 1:
                     unit_id = f"{r}／{ts}"
                 elif r % 3 == 2:
                     unit_id = f"V{r:02d}／{ts}"
@@ -78,26 +113,237 @@ def build_synthetic_source_markdown(
                 unit_id = f"{r} · {ts}"
 
             if case_id == "C01" and r == 1:
-                orig = f"口播原话含ASR误差（{PRIVATE_SENTINEL}）与转义竖线 A\\|B"
+                orig = f"第一句已存文字含ASR误差（{PRIVATE_SENTINEL}）与转义竖线 A\\|B"
             elif case_id == "C01" and r == 2:
                 orig = "[画面：纯画面转场，无对白]"
             elif case_id == "C01" and r == 3:
                 orig = "[画面：举起道具] 这里直接说核心卖点"
             elif case_id == "C02" and r == 1:
                 orig = "超长原文测试：" + ("这是用于验证单行长度上限的原文句子。" * (long_cell_chars // 16 + 1))
+            elif case_id == "C10" and r == 5:
+                orig = REAL_C10_A05
             elif case_id == "C10" and r == 49:
                 orig = f"C10末尾单元原文（{PRIVATE_SENTINEL}）"
+            elif case_id == "C11" and r == 6:
+                orig = REAL_C11_B06
             elif case_id == "C11" and r == 51:
-                orig = "无对白"
+                orig = REAL_C11_B51
             else:
-                orig = f"{case_id} 第{r}条原始口播记录，保留原貌"
+                orig = f"{case_id} 第{r}条原始文字记录，保留原貌"
 
             analysis = f"{case_id} 第{r}条既有分析，含原始评注"
-            group = f"分组-{(r % 4) + 1}"
+            group = f"{case_id}-G{((r - 1) % max(1, group_counts[case_idx])) + 1:02d}"
             lines.append(f"| {unit_id} | {orig} | {analysis} | {group} |")
         lines.append("")
 
     return "\n".join(lines)
+
+
+def build_synthetic_supplement_markdown(
+    *,
+    truncate_after_case: int | None = None,
+    drop_item_in_case: str | None = None,
+    inject_siyuan_inside_black9: bool = False,
+) -> str:
+    """Build a realistic extracted BODY from the Notion 22-page supplement document."""
+    lines: list[str] = [
+        "# 22版本逐段补研究",
+        "",
+        "## 一、研究背景与说明",
+        "前置说明段落，不纳入单案补研究。",
+        "",
+        "## 二、黑桃11版本逐段补研究",
+        "",
+    ]
+
+    limit = truncate_after_case if truncate_after_case is not None else len(consolidate.EXPECTED_CASE_IDS)
+    for idx, case_id in enumerate(consolidate.EXPECTED_CASE_IDS[:limit], start=1):
+        lines.append(f"### {case_id}｜黑桃9案例标题{idx}")
+        item_nums = [1, 2, 3] if case_id == drop_item_in_case else [1, 2, 3, 4]
+        for num in item_nums:
+            if case_id == "C01" and num == 1:
+                lines.append(
+                    f"1. **开场结构复盘**：保留 `<br>` 标记示例第一段<br>第二段含私密锚点（{PRIVATE_SENTINEL}）与 **加粗强调**。"
+                )
+            elif num == 2:
+                lines.append(f"2. **节奏拆解（{case_id}）**：第一行含<br/>软换行。")
+                lines.append("    - 缩进子项原样保留不丢弃")
+            else:
+                lines.append(f"{num}. **{case_id} 补研究项 {num}**：完整原样分析文本，含 `inline_code` 与 *斜体*。")
+        lines.append("")
+
+    if inject_siyuan_inside_black9:
+        lines.append("### S01｜思远误混入黑桃区")
+        lines.append(f"1. {SIYUAN_NOISE}")
+        lines.append("")
+
+    lines.extend(
+        [
+            "## 三、思远11版本逐段补研究",
+            "",
+            "### S01｜思远案例1",
+            f"1. 思远内容绝不进入黑桃9汇总：{SIYUAN_NOISE}",
+            "2. 思远第二项",
+            "3. 思远第三项",
+            "4. 思远第四项",
+            "",
+            "## 四、用户最终成稿",
+            f"用户最终成稿内容绝不进入黑桃9汇总：{USER_SCRIPT_NOISE}",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def standard_github_tools_schema() -> dict[str, Any]:
+    """Realistic GitHub MCP tool schemas for get_file_contents and push_files."""
+    return {
+        "tools": [
+            {
+                "name": "get_file_contents",
+                "description": "Get file contents from a GitHub repository",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "owner": {"type": "string"},
+                        "repo": {"type": "string"},
+                        "path": {"type": "string"},
+                        "branch": {"type": "string"},
+                    },
+                    "required": ["owner", "repo", "path"],
+                },
+            },
+            {
+                "name": "push_files",
+                "description": "Push multiple files in a single commit",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "owner": {"type": "string"},
+                        "repo": {"type": "string"},
+                        "branch": {"type": "string"},
+                        "message": {"type": "string"},
+                        "files": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {"type": "string"},
+                                    "content": {"type": "string"},
+                                },
+                                "required": ["path", "content"],
+                            },
+                        },
+                    },
+                    "required": ["owner", "repo", "branch", "message", "files"],
+                },
+            },
+            {
+                "name": "unrelated_github_tool",
+                "description": "Should not appear in inspect relevant output",
+                "inputSchema": {"type": "object", "properties": {}},
+            },
+        ]
+    }
+
+
+def build_existing_emade_sync_fixtures(existing_count: int = 101) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build realistic yinanan77/E-Made .sync/state.json (101 items) and sync-config.json."""
+    items: dict[str, Any] = {}
+    canonical: dict[str, str] = {}
+    for i in range(1, existing_count + 1):
+        rel = f"existing_notes/doc_{i:03d}.md"
+        pid = f"22222222-3333-4444-8555-{i:012d}"
+        items[f"source::{rel}"] = {
+            "id": pid,
+            "kind": "source",
+            "hash": f"{i:064x}",
+            "source": rel,
+        }
+        canonical[rel] = pid
+
+    state_obj: dict[str, Any] = {
+        "version": 1,
+        "last_synced_at": "2026-11-26T12:00:00Z",
+        "items": items,
+    }
+    config_obj: dict[str, Any] = {
+        "root_page_id": ROOT_PARENT_ID,
+        "sync_interval_minutes": 30,
+        "canonical_page_ids": canonical,
+        "manually_managed_source_paths": [
+            "archive/black9_original_analysis.md",
+            "archive/manual_only_page.md",
+        ],
+        "extra_preserved_setting": {"keep_intact": True, "tags": ["v1", "prod"]},
+    }
+    return state_obj, config_obj
+
+
+class MockGitHubServer:
+    """In-memory fake GitHub MCP server supporting get_file_contents (and tracking push_files)."""
+
+    def __init__(
+        self,
+        *,
+        files: dict[str, str] | None = None,
+        tools_schema: dict[str, Any] | None = None,
+        use_base64: bool = True,
+    ) -> None:
+        self.files: dict[str, str] = dict(files or {})
+        self.tools_schema = tools_schema or standard_github_tools_schema()
+        self.use_base64 = use_base64
+        self.calls: list[tuple[str, dict[str, Any] | None]] = []
+        self.push_files_call_count = 0
+
+    def _wrap_mcp(self, text: str) -> str:
+        return json.dumps(
+            {"result": {"content": [{"type": "text", "text": text}]}},
+            ensure_ascii=False,
+        )
+
+    def subprocess_run(self, cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if len(cmd) >= 3 and cmd[1] == "tools" and cmd[2] == "GitHub":
+            self.calls.append(("tools", None))
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=json.dumps(self.tools_schema, ensure_ascii=False), stderr=""
+            )
+
+        if len(cmd) >= 5 and cmd[1] == "call" and cmd[2] == "GitHub":
+            tool_name = cmd[3]
+            payload = json.loads(cmd[4])
+            self.calls.append((tool_name, payload))
+
+            if tool_name == "get_file_contents":
+                path = payload["path"]
+                if path not in self.files:
+                    return subprocess.CompletedProcess(
+                        cmd, 1, stdout="", stderr=f"Not Found: {path}"
+                    )
+                raw = self.files[path]
+                if self.use_base64:
+                    b64 = base64.b64encode(raw.encode("utf-8")).decode("ascii")
+                    body = json.dumps(
+                        {
+                            "name": Path(path).name,
+                            "path": path,
+                            "sha": consolidate.sha256_text(raw)[:40],
+                            "encoding": "base64",
+                            "content": b64,
+                        },
+                        ensure_ascii=False,
+                    )
+                else:
+                    body = raw
+                return subprocess.CompletedProcess(cmd, 0, stdout=self._wrap_mcp(body), stderr="")
+
+            if tool_name == "push_files":
+                self.push_files_call_count += 1
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=self._wrap_mcp('{"status":"pushed"}'), stderr=""
+                )
+
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr=f"Unsupported GitHub cmd: {cmd}")
 
 
 def standard_notion_tools_schema() -> dict[str, Any]:
@@ -358,7 +604,11 @@ class Black9ConsolidateTests(unittest.TestCase):
         self.assertEqual(report["status"], "ok")
         self.assertEqual(report["case_count"], 11)
         self.assertEqual(report["total_units"], 335)
+        self.assertEqual(report["total_groups"], 108)
         self.assertEqual(report["counts"], list(consolidate.EXPECTED_COUNTS))
+        self.assertEqual(report["group_counts"], list(DEFAULT_GROUP_COUNTS))
+        self.assertFalse(report["supplement_included"])
+        self.assertEqual(report["supplement_item_count"], 0)
 
         bundle_dir = Path(report["bundle_dir"])
         self.assertEqual(bundle_dir.name, consolidate.DEFAULT_FOLDER_NAME)
@@ -367,21 +617,27 @@ class Black9ConsolidateTests(unittest.TestCase):
         manifest = json.loads((bundle_dir / consolidate.MANIFEST_FILENAME).read_text(encoding="utf-8"))
         self.assertEqual(manifest["case_count"], 11)
         self.assertEqual(manifest["total_units"], 335)
+        self.assertEqual(manifest["total_groups"], 108)
         self.assertEqual(manifest["actual_counts"][9], 49)  # C10
         self.assertEqual(manifest["actual_counts"][10], 51)  # C11
         self.assertEqual(manifest["excluded_from_notion"], ["manifest.json"])
+        self.assertTrue(manifest["flat_markdown_no_blank_lines"])
 
-        # Verify C01 preserves verbatim ASR, escaped pipe, visual separation, provenance, and analysis
+        # Verify C01 preserves verbatim ASR, escaped pipe, visual separation, continuous reading, Appendix A, and analysis
         c01_text = (bundle_dir / "01_C01.md").read_text(encoding="utf-8")
         self.assertIn("## 来源与核验说明", c01_text)
-        self.assertIn("未经独立复听原音视频核对", c01_text)
+        self.assertIn("未经独立重新听审原音视频核对", c01_text)
+        self.assertIn("## 文稿连读（依据已存文字，非重新听审）", c01_text)
         self.assertIn("## 原文逐项", c01_text)
-        self.assertIn("## 画面与无对白记录区分清单", c01_text)
+        self.assertIn("## 显式画面与混合记录清单", c01_text)
+        self.assertIn("## 语义分组分析（附录A）", c01_text)
         self.assertIn("## 分析逐项", c01_text)
         self.assertIn("A|B", c01_text)
         self.assertIn("[画面：纯画面转场，无对白]", c01_text)
         self.assertIn("既有分析（1 · 00:00-00:03）：", c01_text)
         self.assertIn("语义分组（1 · 00:00-00:03）：", c01_text)
+        self.assertIn("C01-G01 机制A|机制B", c01_text)
+        self.assertNotIn("口播正文记录", c01_text)
 
         # Verify C10 and C11 exact row identifiers preserved
         c10_text = (bundle_dir / "10_C10.md").read_text(encoding="utf-8")
@@ -390,14 +646,16 @@ class Black9ConsolidateTests(unittest.TestCase):
         c11_text = (bundle_dir / "11_C11.md").read_text(encoding="utf-8")
         self.assertIn("1／00:00-00:03", c11_text)
         self.assertIn("V02／00:03-00:06", c11_text)
-        self.assertIn("51 / ", c11_text)
+        self.assertIn("B06／", c11_text)
+        self.assertIn("B51／", c11_text)
 
-        # Verify ALL generated .md files strictly < 1900 chars/line and never copy Siyuan/user scripts
+        # Verify ALL generated .md files strictly < 1900 chars/line, NO blank lines, and never copy Siyuan/user scripts
         for entry in manifest["files"]:
             md_path = bundle_dir / entry["filename"]
             text = md_path.read_text(encoding="utf-8")
             self.assertNotIn(SIYUAN_NOISE, text)
             self.assertNotIn(USER_SCRIPT_NOISE, text)
+            self.assertNotIn("\n\n", text)
             max_len = consolidate.validate_flat_markdown(text, entry["filename"])
             self.assertLess(max_len, 1900)
             self.assertEqual(consolidate.sha256_text(text), entry["sha256"])
@@ -408,6 +666,255 @@ class Black9ConsolidateTests(unittest.TestCase):
         self.assertIn("source_analysis.md", ref_text)
         self.assertNotIn(SIYUAN_NOISE, ref_text)
         self.assertNotIn(USER_SCRIPT_NOISE, ref_text)
+
+    def test_real_format_visual_mixed_regression_c10_c11_and_no_spoken_count(self) -> None:
+        # Direct unit regressions for real-format C11 B06, B51 and C10 A05
+        self.assertEqual(consolidate.classify_original_cell(REAL_C11_B06), "visual_or_non_spoken")
+        self.assertEqual(consolidate.classify_original_cell(REAL_C11_B51), "visual_or_non_spoken")
+        self.assertEqual(consolidate.classify_original_cell(REAL_C10_A05), "mixed_visual_and_text")
+        self.assertEqual(consolidate.classify_original_cell("普通未标注已存文字"), "source_text_unverified")
+
+        report = consolidate.build_bundle(
+            source_path=self.source_file,
+            output_dir=self.output_root,
+            source_urls=["https://www.notion.so/source-page-1"],
+        )
+        bundle_dir = Path(report["bundle_dir"])
+        manifest = json.loads((bundle_dir / consolidate.MANIFEST_FILENAME).read_text(encoding="utf-8"))
+
+        # Ensure spoken_count is removed from manifest and conservative counts are accurate
+        cases_by_id = {c["case_id"]: c for c in manifest["cases"]}
+        for c in manifest["cases"]:
+            self.assertNotIn("spoken_count", c)
+            self.assertIn("source_text_unverified_count", c)
+            self.assertIn("visual_or_mixed_count", c)
+
+        # C11 must NOT claim 51 spoken / 0 visual; B06 & B51 are visual_or_non_spoken
+        c11_meta = cases_by_id["C11"]
+        self.assertEqual(c11_meta["unit_count"], 51)
+        self.assertEqual(c11_meta["visual_or_mixed_count"], 2)
+        self.assertEqual(c11_meta["source_text_unverified_count"], 49)
+        c11_rows = {r["index"]: r for r in c11_meta["rows"]}
+        self.assertEqual(c11_rows[6]["classification"], "visual_or_non_spoken")
+        self.assertEqual(c11_rows[51]["classification"], "visual_or_non_spoken")
+
+        # C10 A05 must be mixed_visual_and_text (never inferred spoken)
+        c10_meta = cases_by_id["C10"]
+        self.assertEqual(c10_meta["unit_count"], 49)
+        self.assertEqual(c10_meta["visual_or_mixed_count"], 1)
+        self.assertEqual(c10_meta["source_text_unverified_count"], 48)
+        c10_rows = {r["index"]: r for r in c10_meta["rows"]}
+        self.assertEqual(c10_rows[5]["classification"], "mixed_visual_and_text")
+
+        # Check rendered markdown contains no "口播正文" or fictitious "纯音乐" assertions
+        for fname in ("00_index.md", "10_C10.md", "11_C11.md"):
+            text = (bundle_dir / fname).read_text(encoding="utf-8")
+            self.assertNotIn("口播正文", text)
+            self.assertNotIn("纯音乐", text)
+
+    def test_continuous_clean_reading_section_before_raw_original_no_loss(self) -> None:
+        report = consolidate.build_bundle(
+            source_path=self.source_file,
+            output_dir=self.output_root,
+        )
+        bundle_dir = Path(report["bundle_dir"])
+
+        # Inspect C11: continuous section appears BEFORE ## 原文逐项 and excludes B06 & B51 ONLY
+        c11_text = (bundle_dir / "11_C11.md").read_text(encoding="utf-8")
+        idx_clean = c11_text.index("## 文稿连读（依据已存文字，非重新听审）")
+        idx_raw = c11_text.index("## 原文逐项")
+        idx_vis = c11_text.index("## 显式画面与混合记录清单")
+        idx_grp = c11_text.index("## 语义分组分析（附录A）")
+        self.assertLess(idx_clean, idx_raw)
+        self.assertLess(idx_raw, idx_vis)
+        self.assertLess(idx_vis, idx_grp)
+
+        clean_section = c11_text[idx_clean:idx_raw]
+        raw_section = c11_text[idx_raw:idx_vis]
+        vis_section = c11_text[idx_vis:idx_grp]
+
+        # Excluded visual rows NOT in clean reading, but ARE preserved literally in both raw and visual sections
+        self.assertNotIn(REAL_C11_B06, clean_section)
+        self.assertNotIn(REAL_C11_B51, clean_section)
+        self.assertIn(REAL_C11_B06, raw_section)
+        self.assertIn(REAL_C11_B51, raw_section)
+        self.assertIn(REAL_C11_B06, vis_section)
+        self.assertIn(REAL_C11_B51, vis_section)
+
+        # Unmarked source text rows appear verbatim in source order with no invented transitions
+        self.assertIn("C11 第1条原始文字记录，保留原貌", clean_section)
+        self.assertIn("C11 第5条原始文字记录，保留原貌", clean_section)
+        self.assertIn("C11 第7条原始文字记录，保留原貌", clean_section)
+        self.assertLess(
+            clean_section.index("C11 第5条原始文字记录，保留原貌"),
+            clean_section.index("C11 第7条原始文字记录，保留原貌"),
+        )
+
+        # C10 A05 (ambiguous mixed) also excluded from clean reading, preserved in raw + visual/mixed sections
+        c10_text = (bundle_dir / "10_C10.md").read_text(encoding="utf-8")
+        c10_clean = c10_text[
+            c10_text.index("## 文稿连读（依据已存文字，非重新听审）") : c10_text.index("## 原文逐项")
+        ]
+        c10_raw = c10_text[c10_text.index("## 原文逐项") : c10_text.index("## 显式画面与混合记录清单")]
+        c10_vis = c10_text[
+            c10_text.index("## 显式画面与混合记录清单") : c10_text.index("## 语义分组分析（附录A）")
+        ]
+        self.assertNotIn(REAL_C10_A05, c10_clean)
+        self.assertIn(REAL_C10_A05, c10_raw)
+        self.assertIn(REAL_C10_A05, c10_vis)
+
+    def test_appendix_a_108_groups_included_and_invalid_appendix_a_fails_before_write(self) -> None:
+        report = consolidate.build_bundle(
+            source_path=self.source_file,
+            output_dir=self.output_root,
+        )
+        bundle_dir = Path(report["bundle_dir"])
+        manifest = json.loads((bundle_dir / consolidate.MANIFEST_FILENAME).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["total_groups"], 108)
+        self.assertEqual(sum(c["group_count"] for c in manifest["cases"]), 108)
+
+        # Verify all 7 columns of Appendix A are losslessly rendered in C09 (8 groups)
+        c09_text = (bundle_dir / "09_C09.md").read_text(encoding="utf-8")
+        for g in range(1, 9):
+            gid = f"C09-G{g:02d}"
+            self.assertIn(f"### 分组 {g:02d}｜{gid}", c09_text)
+            self.assertIn(f"mechanisms（{gid}）：{gid} 机制A|机制B", c09_text)
+            self.assertIn(f"read-before（{gid}）：{gid} 读到这里前状态", c09_text)
+            self.assertIn(f"change（{gid}）：{gid} 本组造成的认知变化", c09_text)
+            self.assertIn(f"position/reason（{gid}）：{gid} 放置在此位置的原因", c09_text)
+            self.assertIn(f"next-expectation（{gid}）：{gid} 引发的下一组期待", c09_text)
+            self.assertIn(f"deletion-loss（{gid}）：{gid} 删掉后的结构损失", c09_text)
+
+        # Missing Appendix A must fail before creating output
+        no_a = self.tmp_path / "no_appendix_a.md"
+        no_a.write_text(build_synthetic_source_markdown(include_appendix_a=False), encoding="utf-8")
+        never_out = self.tmp_path / "never_appendix_a"
+        with self.assertRaises(consolidate.SourceParseError):
+            consolidate.build_bundle(source_path=no_a, output_dir=never_out)
+        self.assertFalse(never_out.exists())
+
+        # Wrong Appendix A group count (107 instead of 108) must fail before creating output
+        bad_groups = list(DEFAULT_GROUP_COUNTS)
+        bad_groups[8] = 7  # 107 total
+        bad_a = self.tmp_path / "bad_groups_107.md"
+        bad_a.write_text(build_synthetic_source_markdown(group_counts=tuple(bad_groups)), encoding="utf-8")
+        with self.assertRaises(consolidate.SourceParseError):
+            consolidate.build_bundle(source_path=bad_a, output_dir=never_out)
+        self.assertFalse(never_out.exists())
+
+    def test_optional_supplement_44_items_markup_preserved_and_siyuan_excluded(self) -> None:
+        supp_file = self.tmp_path / "supplement_22.md"
+        supp_file.write_text(build_synthetic_supplement_markdown(), encoding="utf-8")
+
+        report = consolidate.build_bundle(
+            source_path=self.source_file,
+            output_dir=self.output_root,
+            source_urls=["https://www.notion.so/source-main"],
+            supplement_path=supp_file,
+            supplement_urls=["https://www.notion.so/supplement-22"],
+            vault_dir=self.tmp_path,
+        )
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["total_units"], 335)
+        self.assertEqual(report["total_groups"], 108)
+        self.assertTrue(report["supplement_included"])
+        self.assertEqual(report["supplement_item_count"], 44)
+        self.assertEqual(report["supplement_counts"], [4] * 11)
+        self.assertEqual(report["supplement_sha256"], consolidate.sha256_bytes(supp_file.read_bytes()))
+
+        bundle_dir = Path(report["bundle_dir"])
+        manifest = json.loads((bundle_dir / consolidate.MANIFEST_FILENAME).read_text(encoding="utf-8"))
+        self.assertTrue(manifest["supplement_included"])
+        self.assertEqual(manifest["supplement_item_count"], 44)
+        self.assertEqual(manifest["supplement_urls"], ["https://www.notion.so/supplement-22"])
+        self.assertEqual(manifest["supplement_sha256"], report["supplement_sha256"])
+
+        # Check C01 preserves <br>, <br/>, rich markup, multi-line sub-bullet literally as flat paragraphs
+        c01_text = (bundle_dir / "01_C01.md").read_text(encoding="utf-8")
+        self.assertIn("## 逐段补研究（黑桃9补充材料）", c01_text)
+        self.assertIn("第一段<br>第二段", c01_text)
+        self.assertIn("**加粗强调**", c01_text)
+        self.assertIn("第一行含<br/>软换行。", c01_text)
+        self.assertIn("缩进子项原样保留不丢弃", c01_text)
+        self.assertIn("https://www.notion.so/supplement-22", c01_text)
+        self.assertIn(manifest["supplement_sha256"], c01_text)
+
+        # Verify ALL 13 generated .md files strictly exclude S01/Siyuan/user-final-script and pass flat validation
+        for entry in manifest["files"]:
+            text = (bundle_dir / entry["filename"]).read_text(encoding="utf-8")
+            self.assertNotIn(SIYUAN_NOISE, text)
+            self.assertNotIn(USER_SCRIPT_NOISE, text)
+            self.assertNotIn("S01｜", text)
+            self.assertNotIn("思远11版本", text)
+            max_len = consolidate.validate_flat_markdown(text, entry["filename"])
+            self.assertLess(max_len, 1900)
+
+        # Verify CLI --vault alias and --supplement / --supplement-url work end to end
+        cli_out = self.tmp_path / "cli_supp_out"
+        cli_out.mkdir()
+        out_buf = io.StringIO()
+        with contextlib.redirect_stdout(out_buf):
+            rc = consolidate.main(
+                [
+                    "build",
+                    "--source",
+                    str(self.source_file),
+                    "--output",
+                    str(cli_out),
+                    "--vault",
+                    str(self.tmp_path),
+                    "--supplement",
+                    str(supp_file),
+                    "--supplement-url",
+                    "https://www.notion.so/supplement-22",
+                ]
+            )
+        self.assertEqual(rc, 0)
+        cli_report = json.loads(out_buf.getvalue())
+        self.assertEqual(cli_report["supplement_item_count"], 44)
+        self.assertEqual(cli_report["total_groups"], 108)
+
+    def test_optional_supplement_malformed_truncated_or_siyuan_leak_fails(self) -> None:
+        never_out = self.tmp_path / "never_supp"
+
+        # 1. Truncated supplement (stops at C09 -> only 9 cases)
+        trunc = self.tmp_path / "supp_trunc.md"
+        trunc.write_text(build_synthetic_supplement_markdown(truncate_after_case=9), encoding="utf-8")
+        with self.assertRaises(consolidate.SourceParseError):
+            consolidate.build_bundle(
+                source_path=self.source_file, output_dir=never_out, supplement_path=trunc
+            )
+        self.assertFalse(never_out.exists())
+
+        # 2. Missing 4th numbered item in C11 (43 != 44)
+        missing_item = self.tmp_path / "supp_missing_item.md"
+        missing_item.write_text(
+            build_synthetic_supplement_markdown(drop_item_in_case="C11"), encoding="utf-8"
+        )
+        with self.assertRaises(consolidate.SourceParseError):
+            consolidate.build_bundle(
+                source_path=self.source_file, output_dir=never_out, supplement_path=missing_item
+            )
+        self.assertFalse(never_out.exists())
+
+        # 3. Unexpected S01/Siyuan ### heading leaked inside Black9 section
+        leaked = self.tmp_path / "supp_leaked_siyuan.md"
+        leaked.write_text(
+            build_synthetic_supplement_markdown(inject_siyuan_inside_black9=True), encoding="utf-8"
+        )
+        with self.assertRaises(consolidate.SourceParseError):
+            consolidate.build_bundle(
+                source_path=self.source_file, output_dir=never_out, supplement_path=leaked
+            )
+        self.assertFalse(never_out.exists())
+
+        # 4. --supplement-url without --supplement fails cleanly
+        with self.assertRaises(consolidate.SourceParseError):
+            consolidate.build_bundle(
+                source_path=self.source_file,
+                output_dir=never_out,
+                supplement_urls=["https://www.notion.so/orphan-url"],
+            )
 
     def test_idempotent_builder_and_conflict_protection(self) -> None:
         first = consolidate.build_bundle(
@@ -936,6 +1443,374 @@ class Black9SyncTests(unittest.TestCase):
         with mock.patch("subprocess.run", side_effect=server.subprocess_run):
             with self.assertRaises(consolidate.PathSafetyError):
                 sync.run_sync(state_path=self.state_path, client=client, only=["C11"])
+
+
+class Black9DeployTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._tmp.name)
+
+        self.source_file = self.tmp_path / "source_analysis.md"
+        self.source_file.write_text(build_synthetic_source_markdown(), encoding="utf-8")
+        self.supp_file = self.tmp_path / "supplement_22.md"
+        self.supp_file.write_text(build_synthetic_supplement_markdown(), encoding="utf-8")
+
+        # Build bundle in staging directory outside vault (safest workflow)
+        self.staging_dir = self.tmp_path / "staging"
+        self.staging_dir.mkdir()
+        build_report = consolidate.build_bundle(
+            source_path=self.source_file,
+            output_dir=self.staging_dir,
+            source_urls=["https://www.notion.so/source-main"],
+            supplement_path=self.supp_file,
+            supplement_urls=["https://www.notion.so/supplement-22"],
+        )
+        self.bundle_dir = Path(build_report["bundle_dir"])
+
+        # Prepare realistic local Obsidian vault with existing originals and existing .sync metadata
+        self.vault_dir = self.tmp_path / "E-Made"
+        self.vault_dir.mkdir()
+        (self.vault_dir / "archive").mkdir()
+        self.existing_original = self.vault_dir / "archive" / "black9_original_analysis.md"
+        self.existing_original.write_text("ORIGINAL USER ANALYSIS DO NOT TOUCH\n", encoding="utf-8")
+        (self.vault_dir / ".sync").mkdir()
+        self.existing_state, self.existing_config = build_existing_emade_sync_fixtures(101)
+        self.local_state_text = json.dumps(self.existing_state, ensure_ascii=False, indent=2) + "\n"
+        self.local_config_text = json.dumps(self.existing_config, ensure_ascii=False, indent=2) + "\n"
+        (self.vault_dir / ".sync" / "state.json").write_text(self.local_state_text, encoding="utf-8")
+        (self.vault_dir / "sync-config.json").write_text(self.local_config_text, encoding="utf-8")
+
+        # Init Notion pages via sync.py init against MockNotionServer
+        self.notion_server = MockNotionServer()
+        self.sync_state_path = self.tmp_path / "sync_work" / "black9_state.json"
+        self.sync_state_path.parent.mkdir()
+        with mock.patch("subprocess.run", side_effect=self.notion_server.subprocess_run):
+            init_res = sync.run_init(
+                folder=self.bundle_dir,
+                parent_id=ROOT_PARENT_ID,
+                state_path=self.sync_state_path,
+                client=sync.MinisMcpNotionClient(),
+            )
+        self.assertEqual(init_res["total_tracked_pages"], 13)
+
+        # Simulate realistic Notion fetch blank-line formatting on remote child pages
+        sync_state = json.loads(self.sync_state_path.read_text(encoding="utf-8"))
+        for meta in sync_state["pages"].values():
+            pid = meta["page_id"]
+            self.notion_server.pages[pid]["content"] = self.notion_server.pages[pid]["content"].replace(
+                "\n", "\n\n"
+            )
+
+        self.github_server = MockGitHubServer(
+            files={
+                ".sync/state.json": self.local_state_text,
+                "sync-config.json": self.local_config_text,
+            }
+        )
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _combined_mcp_run(self, cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if len(cmd) >= 3 and cmd[2] == "GitHub":
+            return self.github_server.subprocess_run(cmd, **kwargs)
+        return self.notion_server.subprocess_run(cmd, **kwargs)
+
+    def test_deploy_prepare_preserves_101_records_verifies_remote_and_exports_push_payload(self) -> None:
+        out_dir = self.tmp_path / "deploy_out"
+        with mock.patch("subprocess.run", side_effect=self._combined_mcp_run):
+            res = deploy.run_prepare(
+                bundle_dir=self.bundle_dir,
+                sync_state_path=self.sync_state_path,
+                vault_dir=self.vault_dir,
+                out_dir=out_dir,
+                github_client=deploy.MinisMcpGitHubClient(),
+                notion_client=sync.MinisMcpNotionClient(),
+            )
+
+        self.assertEqual(res["status"], "ok")
+        self.assertFalse(res["auto_published"])
+        self.assertEqual(self.github_server.push_files_call_count, 0)  # NEVER auto-publishes!
+        self.assertTrue(res["push_schema_validated"])
+        self.assertEqual(res["registered_pages_count"], 13)
+        self.assertEqual(res["push_files_count"], 16)  # 13 .md + manifest.json + .sync/state.json + sync-config.json
+
+        # Check merge stats and full preservation of all 101 existing records + all config fields
+        stats = res["merge_stats"]
+        self.assertEqual(stats["existing_state_items_count"], 101)
+        self.assertEqual(stats["preserved_unrelated_state_items_count"], 101)
+        self.assertEqual(stats["added_state_items_count"], 13)
+        self.assertEqual(stats["total_merged_state_items_count"], 114)
+        self.assertEqual(stats["added_canonical_ids_count"], 13)
+        self.assertEqual(stats["preserved_manually_managed_count"], 2)
+
+        merged_state = json.loads((out_dir / "merged_state.json").read_text(encoding="utf-8"))
+        self.assertEqual(merged_state["version"], 1)
+        self.assertEqual(merged_state["last_synced_at"], "2026-11-26T12:00:00Z")
+        self.assertEqual(len(merged_state["items"]), 114)
+        for old_key, old_val in self.existing_state["items"].items():
+            self.assertEqual(merged_state["items"][old_key], old_val)
+
+        # Ensure 00_index and 90_source_reference are synced; manifest.json and old originals are NOT registered
+        folder = consolidate.DEFAULT_FOLDER_NAME
+        self.assertIn(f"source::{folder}/00_index.md", merged_state["items"])
+        self.assertIn(f"source::{folder}/01_C01.md", merged_state["items"])
+        self.assertIn(f"source::{folder}/11_C11.md", merged_state["items"])
+        self.assertIn(f"source::{folder}/90_source_reference.md", merged_state["items"])
+        self.assertNotIn(f"source::{folder}/manifest.json", merged_state["items"])
+        self.assertNotIn("source::archive/black9_original_analysis.md", merged_state["items"])
+
+        # Verify baseline hash matches local blank-line-free flat bytes
+        c01_local_sha = consolidate.sha256_bytes((self.bundle_dir / "01_C01.md").read_bytes())
+        self.assertEqual(
+            merged_state["items"][f"source::{folder}/01_C01.md"]["hash"], c01_local_sha
+        )
+        self.assertEqual(
+            merged_state["items"][f"source::{folder}/01_C01.md"]["kind"], "source"
+        )
+        self.assertEqual(
+            merged_state["items"][f"source::{folder}/01_C01.md"]["source"], f"{folder}/01_C01.md"
+        )
+
+        # Verify sync-config.json preserves all existing fields, canonical_page_ids, and manually_managed_source_paths
+        merged_config = json.loads((out_dir / "merged_sync-config.json").read_text(encoding="utf-8"))
+        self.assertEqual(merged_config["root_page_id"], ROOT_PARENT_ID)
+        self.assertEqual(merged_config["sync_interval_minutes"], 30)
+        self.assertEqual(merged_config["extra_preserved_setting"], self.existing_config["extra_preserved_setting"])
+        self.assertEqual(
+            merged_config["manually_managed_source_paths"],
+            self.existing_config["manually_managed_source_paths"],
+        )
+        self.assertEqual(len(merged_config["canonical_page_ids"]), 114)
+        for old_k, old_v in self.existing_config["canonical_page_ids"].items():
+            self.assertEqual(merged_config["canonical_page_ids"][old_k], old_v)
+        self.assertIn(f"{folder}/00_index.md", merged_config["canonical_page_ids"])
+        self.assertIn(f"{folder}/90_source_reference.md", merged_config["canonical_page_ids"])
+
+        # Verify exported GitHub push_files payload JSON
+        payload = json.loads((out_dir / "push_files_payload.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["owner"], "yinanan77")
+        self.assertEqual(payload["repo"], "E-Made")
+        self.assertEqual(payload["branch"], "main")
+        self.assertTrue(payload["message"])
+        pushed_paths = [f["path"] for f in payload["files"]]
+        self.assertEqual(len(pushed_paths), 16)
+        self.assertIn(f"{folder}/manifest.json", pushed_paths)
+        self.assertIn(".sync/state.json", pushed_paths)
+        self.assertIn("sync-config.json", pushed_paths)
+        self.assertFalse(any(p.startswith(".github/") or p.startswith("scripts/") for p in pushed_paths))
+
+        # Backups of both GitHub and local vault metadata exist and match originals
+        self.assertEqual((out_dir / "backups" / "github_state.json").read_text(encoding="utf-8"), self.local_state_text)
+        self.assertEqual((out_dir / "backups" / "local_state.json").read_text(encoding="utf-8"), self.local_state_text)
+
+        # Ensure child pages created by sync.py init contain NO injected task_marker body content
+        init_state = json.loads(self.sync_state_path.read_text(encoding="utf-8"))
+        task_marker = init_state["task_marker"]
+        for doc_id, meta in init_state["pages"].items():
+            pid = meta["page_id"]
+            self.assertNotIn(task_marker, self.notion_server.pages[pid]["content"], f"Marker leaked into {doc_id}")
+
+    def test_deploy_prepare_rejects_remote_mismatch_collision_and_never_auto_publishes(self) -> None:
+        init_state = json.loads(self.sync_state_path.read_text(encoding="utf-8"))
+        c10_pid = init_state["pages"]["C10"]["page_id"]
+        orig_c10_remote = self.notion_server.pages[c10_pid]["content"]
+
+        # 1. Remote Notion page diverges from local canonical full content -> MUST fail before writing payload!
+        self.notion_server.pages[c10_pid]["content"] = orig_c10_remote + "\n\n未同步的远端改动"
+        bad_out = self.tmp_path / "fail_mismatch_out"
+        with mock.patch("subprocess.run", side_effect=self._combined_mcp_run):
+            with self.assertRaises(deploy.DeployError):
+                deploy.run_prepare(
+                    bundle_dir=self.bundle_dir,
+                    sync_state_path=self.sync_state_path,
+                    vault_dir=self.vault_dir,
+                    out_dir=bad_out,
+                    github_client=deploy.MinisMcpGitHubClient(),
+                    notion_client=sync.MinisMcpNotionClient(),
+                )
+        self.assertFalse((bad_out / "push_files_payload.json").exists())
+        self.assertEqual(self.github_server.push_files_call_count, 0)
+        self.notion_server.pages[c10_pid]["content"] = orig_c10_remote
+
+        # 2. Existing .sync/state.json has colliding key pointing to a different Notion ID -> MUST fail!
+        colliding_state = json.loads(self.local_state_text)
+        folder = consolidate.DEFAULT_FOLDER_NAME
+        colliding_state["items"][f"source::{folder}/01_C01.md"] = {
+            "id": "99999999-9999-4999-8999-999999999999",
+            "kind": "source",
+            "hash": "0" * 64,
+            "source": f"{folder}/01_C01.md",
+        }
+        self.github_server.files[".sync/state.json"] = json.dumps(colliding_state, ensure_ascii=False)
+        with mock.patch("subprocess.run", side_effect=self._combined_mcp_run):
+            with self.assertRaises(deploy.DeployError):
+                deploy.run_prepare(
+                    bundle_dir=self.bundle_dir,
+                    sync_state_path=self.sync_state_path,
+                    vault_dir=self.vault_dir,
+                    out_dir=self.tmp_path / "fail_collision_out",
+                    github_client=deploy.MinisMcpGitHubClient(),
+                    notion_client=sync.MinisMcpNotionClient(),
+                )
+        self.assertEqual(self.github_server.push_files_call_count, 0)
+
+    def test_deploy_install_copies_only_new_folder_protects_originals_and_metadata(self) -> None:
+        backup_out = self.tmp_path / "install_backups"
+
+        # 1. Dry run writes nothing
+        dry = deploy.run_install(
+            bundle_dir=self.bundle_dir,
+            vault_dir=self.vault_dir,
+            out_dir=backup_out,
+            dry_run=True,
+        )
+        self.assertEqual(dry["status"], "dry_run")
+        self.assertEqual(len(dry["files"]), 14)  # 13 .md + manifest.json
+        target_dir = self.vault_dir / consolidate.DEFAULT_FOLDER_NAME
+        self.assertFalse(target_dir.exists())
+        self.assertFalse(backup_out.exists())
+
+        # 2. Real install copies ONLY new folder files, backs up metadata, does NOT overwrite local sync metadata!
+        res = deploy.run_install(
+            bundle_dir=self.bundle_dir,
+            vault_dir=self.vault_dir,
+            out_dir=backup_out,
+        )
+        self.assertEqual(res["status"], "ok")
+        self.assertFalse(res["local_sync_metadata_overwritten"])
+        self.assertTrue(target_dir.is_dir())
+        self.assertEqual(len(list(target_dir.iterdir())), 14)
+        # Local original and old sync metadata remain completely untouched
+        self.assertEqual(
+            self.existing_original.read_text(encoding="utf-8"),
+            "ORIGINAL USER ANALYSIS DO NOT TOUCH\n",
+        )
+        self.assertEqual(
+            (self.vault_dir / ".sync" / "state.json").read_text(encoding="utf-8"),
+            self.local_state_text,
+        )
+        self.assertEqual(
+            (self.vault_dir / "sync-config.json").read_text(encoding="utf-8"),
+            self.local_config_text,
+        )
+        self.assertEqual(
+            (backup_out / "backups" / "local_state.json").read_text(encoding="utf-8"),
+            self.local_state_text,
+        )
+
+        # 3. Byte-identical re-install is idempotent
+        again = deploy.run_install(
+            bundle_dir=self.bundle_dir,
+            vault_dir=self.vault_dir,
+            out_dir=backup_out,
+        )
+        self.assertTrue(all(f["action"] == "identical" for f in again["files"]))
+
+        # 4. Non-identical existing file in target folder is rejected without overwrite
+        c01_dst = target_dir / "01_C01.md"
+        c01_dst.write_text("LOCAL USER EDIT\n", encoding="utf-8")
+        with self.assertRaises(consolidate.PathSafetyError):
+            deploy.run_install(bundle_dir=self.bundle_dir, vault_dir=self.vault_dir)
+        self.assertEqual(c01_dst.read_text(encoding="utf-8"), "LOCAL USER EDIT\n")
+
+        # 5. Path traversal in --folder-relpath rejected
+        with self.assertRaises(consolidate.PathSafetyError):
+            deploy.run_install(
+                bundle_dir=self.bundle_dir,
+                vault_dir=self.vault_dir,
+                folder_relpath="../escape",
+            )
+
+        # 6. Explicit --install-metadata-from requires --out backup dir and backs up BEFORE writing
+        c01_dst.write_bytes((self.bundle_dir / "01_C01.md").read_bytes())
+        prep_out = self.tmp_path / "prep_for_meta"
+        with mock.patch("subprocess.run", side_effect=self._combined_mcp_run):
+            deploy.run_prepare(
+                bundle_dir=self.bundle_dir,
+                sync_state_path=self.sync_state_path,
+                vault_dir=self.vault_dir,
+                out_dir=prep_out,
+                github_client=deploy.MinisMcpGitHubClient(),
+                notion_client=sync.MinisMcpNotionClient(),
+            )
+        with self.assertRaises(deploy.DeployError):
+            deploy.run_install(
+                bundle_dir=self.bundle_dir,
+                vault_dir=self.vault_dir,
+                install_metadata_from=prep_out,
+            )
+        meta_backup_dir = self.tmp_path / "meta_install_backup"
+        meta_res = deploy.run_install(
+            bundle_dir=self.bundle_dir,
+            vault_dir=self.vault_dir,
+            out_dir=meta_backup_dir,
+            install_metadata_from=prep_out,
+        )
+        self.assertTrue(meta_res["local_sync_metadata_overwritten"])
+        self.assertEqual(
+            (meta_backup_dir / "backups" / "local_state.json").read_text(encoding="utf-8"),
+            self.local_state_text,
+        )
+        self.assertEqual(
+            len(json.loads((self.vault_dir / ".sync" / "state.json").read_text(encoding="utf-8"))["items"]),
+            114,
+        )
+
+    def test_deploy_cli_inspect_prepare_install_no_private_payload_or_secret_in_logs(self) -> None:
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        cli_out = self.tmp_path / "cli_deploy_out"
+
+        with mock.patch("subprocess.run", side_effect=self._combined_mcp_run):
+            with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+                rc_insp = deploy.main(["inspect"])
+                rc_prep = deploy.main(
+                    [
+                        "prepare",
+                        "--bundle",
+                        str(self.bundle_dir),
+                        "--sync-state",
+                        str(self.sync_state_path),
+                        "--vault",
+                        str(self.vault_dir),
+                        "--out",
+                        str(cli_out),
+                    ]
+                )
+                rc_inst = deploy.main(
+                    [
+                        "install",
+                        "--bundle",
+                        str(self.bundle_dir),
+                        "--vault",
+                        str(self.vault_dir),
+                        "--out",
+                        str(cli_out),
+                    ]
+                )
+
+        self.assertEqual(rc_insp, 0)
+        self.assertEqual(rc_prep, 0)
+        self.assertEqual(rc_inst, 0)
+
+        # Verify secret redaction on error stderr
+        def leaking_gh_err(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(
+                cmd, 1, stdout="", stderr="GitHub failed Bearer secret_gh_XYZ123"
+            )
+
+        with mock.patch("subprocess.run", side_effect=leaking_gh_err):
+            with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+                rc_err = deploy.main(["inspect"])
+        self.assertEqual(rc_err, 1)
+
+        logs = out_buf.getvalue() + "\n" + err_buf.getvalue()
+        self.assertNotIn(PRIVATE_SENTINEL, logs)
+        self.assertNotIn(SIYUAN_NOISE, logs)
+        self.assertNotIn(USER_SCRIPT_NOISE, logs)
+        self.assertNotIn("secret_gh_XYZ123", logs)
+        self.assertIn("[REDACTED]", logs)
 
 
 if __name__ == "__main__":
