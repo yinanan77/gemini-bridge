@@ -1,0 +1,21 @@
+{
+  "acceptance": [
+    "AUDIT.md实际核5项作者/分组/不变量/证据级别/无额外推断",
+    "只写审核报告和结果清单",
+    "明确通过及未验证边界，不改正文"
+  ],
+  "allowed_write_paths": [
+    "author-series-20261127/AUDIT.md"
+  ],
+  "attempt": 1,
+  "base_branch": "main",
+  "contract_sha256": "e7579809dea0d0ab49ac9a76b5ae29e1845f51861140c0a22903a4e57d3e248c",
+  "goal": "独立只读审核：从分支gpt-gemini/jobs/author-series-c06-20261127固定提交a1a07aee5752f87a4f9e46166c010cdb1dd346bd读取author-series-20261127/AUTHOR_SERIES_INDEX.md、registry.json、CHANGES.md，与同分支inputs/author-series-20261127/registry.json/source-excerpts.md对照。只写本任务允许AUDIT.md，不改作者成果。最高用户证据2026-11-27 11:38：C06/1000070192西装约会长版是思远而非黑桃。审核：C06有作者思远/用户确认/排除黑桃；C06/C09旧group暂停合并保留legacy关系待复核，不否定同人、不把C09也改思远；其它20样本未改，22条id/描述/证据层/旧revision历史不变；top只增指定归属与索引字段、updated_on、revision_history追加；台账6约会候选沿用原库归属本轮未原片作者全核、不冒官方完整数量；原文/定稿不删不改。输出AUDIT.md给通过或必须修+具体原始证据与脚本测试，不能拿自述通过代替。若仅文件路径registry.json后续将发布为调用清单.json或候选未写两端的时态说明，列部署注意而不是作者事实缺陷。不要新增研究推断/重审流量。结果写jobs/author-series-c06-20261127-audit/attempt-01/result.json。",
+  "job_branch": "gpt-gemini/jobs/author-series-c06-20261127-audit",
+  "notes": "独立会话只读审，台账待本机主控写Obsidian/GitHub/Notion。",
+  "repository": "yinanan77/gemini-bridge",
+  "result_snapshot_path": "jobs/author-series-c06-20261127-audit/attempt-01/result.json",
+  "schema_version": 1,
+  "task_id": "author-series-c06-20261127-audit",
+  "task_snapshot_path": "jobs/author-series-c06-20261127-audit/attempt-01/task.json"
+}
