@@ -1,0 +1,268 @@
+{
+  "schema_version": 1,
+  "audit_task_id": "black9-audit-20261127",
+  "audited_target": {
+    "repository": "yinanan77/gemini-bridge",
+    "developer_branch": "gpt-gemini/jobs/black9-consolidate-20261127",
+    "developer_commit": "37aac5aac646cd679f10e0a430a6bb8e1841408f",
+    "files": {
+      "tools/black9/consolidate.py": {
+        "lines": 1185,
+        "sha256": "6e812bac2f282637435edc8fd0c191b47e90eb8ec0c2a72a71842938a03bab86"
+      },
+      "tools/black9/sync.py": {
+        "lines": 1698,
+        "sha256": "bd737c8d840486d689a93268f5721123bf88e28c4b185d0d0bfcbedf158e4c23"
+      },
+      "tools/black9/test_black9.py": {
+        "lines": 942,
+        "sha256": "e1c5ae3dd1ed3f46d98f630aacaed274b3dde4a8735c3f4345c224a0ca7c2af7"
+      },
+      "tools/black9/README.md": {
+        "lines": 132,
+        "sha256": "5b29ca061a1426cb86cf7e6f63047b393b3ad54bdbd9b19001e8bf9801de69e3"
+      }
+    }
+  },
+  "verdict": {
+    "overall": "changes_requested_before_production",
+    "production_ready": false,
+    "summary_counts": {
+      "critical": 2,
+      "high": 5,
+      "medium": 2,
+      "low": 1,
+      "total_findings": 10
+    },
+    "verification_matrix": {
+      "passed_in_mocked_audit": [
+        "Developer baseline 13/13 mocked unit tests pass on commit 37aac5a",
+        "Appendix B 11 cases / [23,22,22,22,37,37,30,26,16,49,51] = 335 units including A01/B01 IDs parsed without digit regex",
+        "Character-lossless line splitting < 1900 chars and flat Markdown output on build",
+        "Zero credential/env/OAuth/var-minis reads, stdlib-only, no background services or schedules",
+        "No private manuscript text leaked into state.json, journal.jsonl, or CLI stdout/stderr during normal runs",
+        "README.md honestly states manual execution only and mocked-only verification (no false auto-deployment claim)",
+        "Runtime envelopes for `tools Notion`, `notion-fetch` (with preamble + <content>), and `notion-create-pages` happy path accepted",
+        "3-way sync --dry-run/--status zero writes, no-op, formatting-only baseline update, local-missing non-deletion, and conflict dual-snapshot preservation"
+      ],
+      "failed_reproduced_defects": [
+        "F01 [CRITICAL]: notion-update-page omits allow_async=false and ignores async_task responses -> stale read-back + permanent push_verify_mismatch journal lock",
+        "F02 [CRITICAL]: Only parses # 附录B; drops all 108 Appendix A group-analysis rows and lacks parser/CLI for separate supplement (## 二、黑桃11版本逐段补研究 C01-C11, 4 questions each)",
+        "F03 [HIGH]: Ancestor symlink traversal escapes state, journal, conflict snapshots, source reads, and build output directories",
+        "F04 [HIGH]: Child pages omit task_marker -> --recover can silently hijack an unrelated page from another parent collection; post-create fetch crash ignores persisted page_id; false-positive timeout deadlocks",
+        "F05 [HIGH]: No recovery path for push_started/push_uncertain/push_verify_mismatch; strict post-push hash equality breaks on Notion URL autolinking; SchemaValidationError poisons journal before network send",
+        "F06 [HIGH]: extract_notion_content_xml wipes entire body if literal <content/> appears in text; fetch_page ignores had_xml_wrapper=False allowing non-XML warnings to overwrite local files on pull",
+        "F07 [HIGH]: Visually ambiguous / non-spoken cells (e.g. '画面展示产品对比', '[特写镜头，推近]', '（纯动作演示，未说话）') misclassified and labeled as '口播正文记录' (spoken transcript)",
+        "F08 [MEDIUM]: sync.py push skips validate_flat_markdown (only checks line length), allowing tables/codeblocks/lists that break GitHub Actions safe_two_way compatibility",
+        "F09 [MEDIUM]: Parser heading regex rigidity (rejects '## C10（标题）', '## 附录B') and column-count mismatch (>=4 header vs !=4 row)",
+        "F10 [LOW]: sync.py CLI returns exit code 0 on status='conflict'; 300-char CLI error snippet only redacts credentials, not echoed private body text"
+      ],
+      "unverified_requires_live_controller": [
+        "Real private source files (actual Appendix A 108 rows, Appendix B 335 rows, separate supplement C01-C11) formatting & edge cases",
+        "Live Minis `minis-mcp-cli` execution against real Notion workspace & OAuth permissions",
+        "Actual Notion Markdown round-trip serialization behavior (autolinks, bracket/pipe escaping, <empty-block/>, large-page async_task timing)",
+        "Live GitHub Actions safe_two_way `.sync/state.json` integration after manual review"
+      ]
+    }
+  },
+  "findings": [
+    {
+      "id": "F01",
+      "severity": "critical",
+      "category": "mcp_runtime_schema_and_async",
+      "title": "notion-update-page omits allow_async=false and ignores async_task responses, causing race failures and permanent journal lock",
+      "locations": [
+        "tools/black9/sync.py:399-467",
+        "tools/black9/sync.py:527-539",
+        "tools/black9/sync.py:1445-1480",
+        "tools/black9/test_black9.py:146-166",
+        "tools/black9/test_black9.py:306-317"
+      ],
+      "reproducer": "reviews/black9-20261127/test_independent.py::Black9AuditDefectReproducers::test_repro_F01_update_page_omits_allow_async_and_ignores_async_task",
+      "impact": "Against runtime `notion-update-page` schema `{page_id, command, new_str, allow_async}`, `sync.py` never sends `allow_async: false` (and fails schema validation if required). When Notion returns `{\"async_task\": ...}`, `update_page` discards the return payload without polling or failing safely; immediate `fetch_page` reads stale content, triggers `push_verify_mismatch`, and permanently locks all future mutating `sync` runs.",
+      "recommendation": "Set `allow_async: false` whenever present in the discovered `notion-update-page` schema; inspect the parsed response in `update_page` for `async_task` (poll with bounded backoff or fail cleanly with a recoverable async-pending state rather than falsely treating it as completed)."
+    },
+    {
+      "id": "F02",
+      "severity": "critical",
+      "category": "user_goal_substantive_coverage",
+      "title": "Parser only ingests # 附录B; drops all 108 Appendix A group-analysis rows and lacks separate supplement C01-C11 ingestion",
+      "locations": [
+        "tools/black9/consolidate.py:334-395",
+        "tools/black9/consolidate.py:636-691",
+        "tools/black9/consolidate.py:1108-1151",
+        "tools/black9/README.md:3",
+        "tools/black9/README.md:22-26"
+      ],
+      "reproducer": "reviews/black9-20261127/test_independent.py::Black9AuditDefectReproducers::test_repro_F02_missing_appendix_a_108_rows_and_supplement_c01_c11",
+      "attribution_note": "Developer task.json only specified `# 附录B` (11 cases / 335 units), so this is primarily a specification gap between the developer task contract and the user's complete goal.",
+      "impact": "Using `consolidate.py` as-is omits two major substantive Black9 analysis sources required by the user's original goal: (1) all 108 detailed group-analysis table rows in `# 附录A` of the main source file, and (2) the 11x4=44 per-case supplementary segment-research Q&As (`## 二、黑桃11版本逐段补研究` -> `### C01`–`C11`, stopping cleanly before `## 三、思远11版本逐段补研究`) in the separate supplement file.",
+      "recommendation": "Extend `consolidate.py` to parse `# 附录A` (validating 108 rows and attaching each case's group analyses into its flat case page) and add an optional `--supplement` input extracting `## 二、黑桃11版本逐段补研究` (`### C01`–`C11`, 4 questions each) strictly stopping at `## 三、思远11版本逐段补研究`."
+    },
+    {
+      "id": "F03",
+      "severity": "high",
+      "category": "path_security_symlink_escape",
+      "title": "Symlinked ancestor directories bypass path safety for state, journal, conflict snapshots, source reads, and bundle output",
+      "locations": [
+        "tools/black9/sync.py:586-597",
+        "tools/black9/consolidate.py:135-170",
+        "tools/black9/consolidate.py:172-180",
+        "tools/black9/consolidate.py:182-206",
+        "tools/black9/consolidate.py:709-713",
+        "tools/black9/consolidate.py:754-758",
+        "tools/black9/consolidate.py:1025-1038",
+        "tools/black9/sync.py:676",
+        "tools/black9/sync.py:1258-1260",
+        "tools/black9/sync.py:1651-1657"
+      ],
+      "reproducer": "reviews/black9-20261127/test_independent.py::Black9AuditDefectReproducers::test_repro_F03_symlink_ancestor_escape_state_bundle_source",
+      "impact": "`check_state_paths_safety` only inspects `state_path.is_symlink()` and immediate `state_path.parent.is_symlink()`; `check_no_symlink_chain(..., stop_at=None)` skips all parent checks despite its docstring; `ensure_safe_file_read` skips even immediate parent checks. Passing `--state <symlink>/nested/state.json` causes `atomic_write_bytes` (`mkdir(parents=True)`) to create directories and write state, journal, and conflict files outside the target tree; `--source <symlink>/s.md` and `--output <symlink>/nested` similarly escape.",
+      "recommendation": "Walk all non-system ancestor path components (or reject whenever any component along the supplied path is a symlink, accounting cleanly for OS root symlinks like `/var` only if explicitly handled) before any read, `mkdir`, or atomic write."
+    },
+    {
+      "id": "F04",
+      "severity": "high",
+      "category": "uncertain_creation_recovery",
+      "title": "Child pages omit task_marker, allowing --recover to hijack an unrelated page from another parent collection; post-create fetch crash ignores saved page_id",
+      "locations": [
+        "tools/black9/sync.py:783-851",
+        "tools/black9/sync.py:1064-1083",
+        "tools/black9/sync.py:1099-1136"
+      ],
+      "reproducer": "reviews/black9-20261127/test_independent.py::Black9AuditDefectReproducers::test_repro_F04_uncertain_create_recover_cross_collection_hijack_and_fetch_crash",
+      "impact": "1) `run_init` journals `page_marker` but never writes it into child page content. When `C01` fails before remote creation under a new parent, `_recover_uncertain_create` misses `pid in parent_body`, falls through to L835-841 matching `title` + `source_sha256`, and silently binds an unrelated `C01` page from an earlier collection under another parent—causing later pushes to overwrite the wrong page. 2) If `create_page` succeeds (saving `page_id` to `state.json`) and immediate `fetch_page` fails, `--recover` ignores the persisted `page_id` and fails when `notion-search` is unavailable or unindexed. 3) If an RPC fails before remote creation and no match exists, `--recover` permanently deadlocks with no operator confirmation path.",
+      "recommendation": "Verify parent ownership strictly (only accept child pages linked under `collection_parent_id` or bearing an embedded unique `page_marker`), check `state['pages'][doc_id]['page_id']` first during recovery before calling `notion-search`, and provide an explicit audited operator override to resolve verified-absent creations."
+    },
+    {
+      "id": "F05",
+      "severity": "high",
+      "category": "sync_recovery_and_serialization",
+      "title": "No recovery path for push journal locks; strict post-push hash equality breaks on Notion URL autolinking; SchemaValidationError poisons journal before send",
+      "locations": [
+        "tools/black9/sync.py:86-104",
+        "tools/black9/sync.py:648",
+        "tools/black9/sync.py:945-946",
+        "tools/black9/sync.py:1003-1020",
+        "tools/black9/sync.py:1066-1083",
+        "tools/black9/sync.py:1272-1276",
+        "tools/black9/sync.py:1433-1480",
+        "tools/black9/test_black9.py:702-709"
+      ],
+      "reproducer": "reviews/black9-20261127/test_independent.py::Black9AuditDefectReproducers::test_repro_F05_unrecoverable_push_journal_lock_and_notion_autolink_drift",
+      "impact": "1) Any `push_started`, `push_uncertain`, or `push_verify_mismatch` journal state permanently blocks all future mutating `sync` runs, and `init --recover` rejects non-`create_page` operations; operators must hand-edit `.journal.jsonl`. 2) Every generated page includes bare `--source-url` (`https://...`); while `init` tolerates local-vs-remote canonical drift by storing separate baselines, `push` requires exact `verified_canon_sha == local_canon_sha` (L1464), causing Notion autolinking (`[url](url)`) or markdown escaping to fail every push and brick sync. 3) `append_journal(..., 'send_started'/'push_started')` runs before `_build_*_payload` validates schemas, poisoning the journal even when zero requests were sent.",
+      "recommendation": "Validate payload schemas BEFORE appending `send_started`/`push_started`; normalize Notion autolinks/markdown escapes conservatively or compare against normalized plaintext tokens for post-push verification; add a dedicated `sync --recover` command that fetches remote state and safely reconciles unresolved push ops."
+    },
+    {
+      "id": "F06",
+      "severity": "high",
+      "category": "xml_parsing_and_pull_data_loss",
+      "title": "extract_notion_content_xml wipes body on literal <content/> and fetch_page accepts unwrapped non-XML responses on pull",
+      "locations": [
+        "tools/black9/consolidate.py:933-957",
+        "tools/black9/sync.py:497-506",
+        "tools/black9/sync.py:1382-1410"
+      ],
+      "reproducer": "reviews/black9-20261127/test_independent.py::Black9AuditDefectReproducers::test_repro_F06_xml_content_self_closing_wipe_and_unwrapped_pull_overwrite",
+      "impact": "1) `if '<content/>' in normalized` runs before matching `<content>...</content>`; any page body containing literal `<content/>` is erased to `''`, wiping the local file to `'\\n'` during `pull`. 2) `fetch_page` discards `had_xml_wrapper`; if `notion-fetch` returns a non-XML truncation/warning message without `isError=true`, `pull` overwrites the local Markdown file with the warning text.",
+      "recommendation": "Only treat `<content/>` as empty when `<content>...</content>` does not wrap it (anchored inside `<page>`); require `had_xml_wrapper=True` in `sync.py` `fetch_page` (or refuse `pull` on unwrapped/unexpectedly empty responses)."
+    },
+    {
+      "id": "F07",
+      "severity": "high",
+      "category": "classification_accuracy",
+      "title": "Visually ambiguous and non-spoken rows are misclassified and affirmatively labeled as '口播正文记录' (spoken transcript)",
+      "locations": [
+        "tools/black9/consolidate.py:48-74",
+        "tools/black9/consolidate.py:208-234",
+        "tools/black9/consolidate.py:516",
+        "tools/black9/consolidate.py:536",
+        "tools/black9/consolidate.py:560",
+        "tools/black9/consolidate.py:620"
+      ],
+      "reproducer": "reviews/black9-20261127/test_independent.py::Black9AuditDefectReproducers::test_repro_F07_visually_ambiguous_rows_mislabeled_spoken_transcript",
+      "impact": "`classify_original_cell` defaults any text not matching a narrow hardcoded regex (requiring e.g. `画面:` with colon or specific bracket words) to `spoken_transcript` rendered as `口播正文记录`. Rows such as `画面展示产品对比`, `[特写镜头，推近]`, `（纯动作演示，未说话）`, and `【片头LOGO】` are falsely presented as spoken transcript.",
+      "recommendation": "Do not label unverified/default rows as spoken transcript; use a neutral default label (`原文单元记录（未独立复听核对）`) and flag bracketed/visual/action-cue rows conservatively as `疑似画面/动作/无对白或混合记录（待复听核验）`."
+    },
+    {
+      "id": "F08",
+      "severity": "medium",
+      "category": "safe_two_way_compatibility",
+      "title": "sync.py push omits validate_flat_markdown, allowing tables/codeblocks/nesting that break GitHub Actions safe_two_way",
+      "locations": [
+        "tools/black9/sync.py:1428-1432",
+        "tools/black9/sync.py:742",
+        "tools/black9/consolidate.py:465-491"
+      ],
+      "reproducer": "reviews/black9-20261127/test_independent.py::Black9AuditDefectReproducers::test_repro_F08_sync_push_allows_non_flat_markdown_breaking_safe_two_way",
+      "impact": "Local edits adding tables, fenced code blocks, blockquotes, or nested lists are pushed to Notion without error because `push` checks only line length `< 1900`, breaking compatibility with the existing GitHub Actions `safe_two_way` engine.",
+      "recommendation": "Run `consolidate.validate_flat_markdown(local_raw, fname)` before pushing (or gate non-flat pushes behind an explicit opt-in flag)."
+    },
+    {
+      "id": "F09",
+      "severity": "medium",
+      "category": "parser_robustness",
+      "title": "Appendix B parser heading regexes are overly rigid and table column validation is inconsistent",
+      "locations": [
+        "tools/black9/consolidate.py:39-43",
+        "tools/black9/consolidate.py:287-308"
+      ],
+      "reproducer": "reviews/black9-20261127/test_independent.py::Black9AuditDefectReproducers::test_repro_F09_parser_heading_rigidity_and_column_check_inconsistency",
+      "impact": "`_CASE_HEADING_RE` rejects `## C10（标题）` and `### C01｜标题`; `_APPENDIX_B_RE` rejects `## 附录B` or `# 附录 B`; `parse_case_table` accepts `len(header_cells) >= 4` at L288 then crashes on `len(cells) != 4` at L304, and silently concatenates multiple 4-column tables if present in one case section.",
+      "recommendation": "Allow common heading separators (`（`, `(`, space) and configurable/H1-H3 heading levels for Appendix B / C01–C11; enforce exact column header matching consistently."
+    },
+    {
+      "id": "F10",
+      "severity": "low",
+      "category": "cli_ergonomics_and_logging",
+      "title": "sync.py exits 0 on conflict status; CLI error snippets do not strip echoed private body text",
+      "locations": [
+        "tools/black9/sync.py:1551",
+        "tools/black9/sync.py:1693-1694",
+        "tools/black9/sync.py:282",
+        "tools/black9/consolidate.py:1057"
+      ],
+      "reproducer": "reviews/black9-20261127/test_independent.py::Black9AuditDefectReproducers::test_repro_F10_conflict_cli_returns_zero_exit_code",
+      "impact": "Callers relying on process exit code cannot distinguish `status='conflict'` from `status='ok'` without parsing stdout JSON. Additionally, if `minis-mcp-cli` fails non-zero and echoes CLI payload args on stderr, up to 300 chars could leak non-secret private text.",
+      "recommendation": "Return a distinct non-zero exit code (e.g., 3) on `status='conflict'`, and avoid echoing raw `proc.stdout`/`proc.stderr` payload snippets without sanitization."
+    }
+  ],
+  "tests_executed": [
+    {
+      "name": "developer_baseline_compile",
+      "command": "python3 -B -m py_compile <extracted_37aac5a>/tools/black9/consolidate.py <extracted_37aac5a>/tools/black9/sync.py <extracted_37aac5a>/tools/black9/test_black9.py",
+      "mode": "local_compile",
+      "passed": 3,
+      "failed": 0,
+      "exit_code": 0
+    },
+    {
+      "name": "developer_baseline_unittest",
+      "command": "python3 -B -m unittest discover -s <extracted_37aac5a>/tools/black9 -p 'test_*.py' -v",
+      "mode": "local_mocked_mcp",
+      "passed": 13,
+      "failed": 0,
+      "exit_code": 0
+    },
+    {
+      "name": "independent_audit_compile",
+      "command": "python3 -B -m py_compile reviews/black9-20261127/test_independent.py",
+      "mode": "local_compile",
+      "passed": 1,
+      "failed": 0,
+      "exit_code": 0
+    },
+    {
+      "name": "independent_audit_probes",
+      "command": "python3 -B -m unittest -v reviews/black9-20261127/test_independent.py",
+      "mode": "local_mocked_mcp_and_reproducers",
+      "passed": 14,
+      "failed": 0,
+      "exit_code": 0,
+      "breakdown": {
+        "positive_verification_probes": 4,
+        "defect_reproducer_probes_confirmed": 10
+      }
+    }
+  ]
+}
